@@ -9,9 +9,10 @@ import qs.Modules.Plugins
 // inbox snapshot as the "inbox" global var, and raises desktop notifications
 // when a thread starts needing attention.
 //
-// It also runs `backend/t3live.py`, the live Limits connection to the local T3
-// server, and publishes its rendered Limits tab as the "limitsLive" global var.
-// The widget sends it pairing commands through the "liveCommand" global var.
+// It also runs `backend/t3live.py`, the live connection to the local T3 server.
+// That process renders the Limits tab ("limitsLive"), streams the thread inbox,
+// which replaces the statev2.sqlite reading while it is live, and answers usage
+// requests ("usageLive"). The widget sends it commands through "liveCommand".
 PluginComponent {
     id: root
 
@@ -29,6 +30,11 @@ PluginComponent {
     property int restarts: 0
     property bool manualRestart: false
 
+    // The inbox from statev2.sqlite, and the one streamed by the live connection, which wins.
+    property var localInbox: null
+    property var liveInbox: null
+    property string inboxSource: ""
+
     function command() {
         const cmd = ["python3", "-I", root.scriptPath];
         if (root.stateDir)
@@ -40,6 +46,21 @@ PluginComponent {
     function publish(snapshot) {
         if (pluginService)
             pluginService.setGlobalVar(pluginId, "inbox", snapshot);
+    }
+
+    // A switch between the two sources starts a new alert baseline, so the small
+    // differences between them do not raise notifications.
+    function publishInbox() {
+        const snapshot = root.liveInbox || root.localInbox;
+        if (!snapshot)
+            return;
+        const source = root.liveInbox ? "live" : "local";
+        if (source !== root.inboxSource) {
+            root.inboxSource = source;
+            root.knownStatuses = null;
+        }
+        root.processAlerts(snapshot);
+        root.publish(snapshot);
     }
 
     function alertTitle(status) {
@@ -90,8 +111,9 @@ PluginComponent {
                 }
                 snapshot.receivedAt = Date.now();
                 root.restarts = 0;
-                root.processAlerts(snapshot);
-                root.publish(snapshot);
+                root.localInbox = snapshot;
+                if (!root.liveInbox)
+                    root.publishInbox();
             }
         }
 
@@ -106,7 +128,7 @@ PluginComponent {
                 restartTimer.restart();
                 return;
             }
-            root.publish({
+            root.localInbox = {
                 "ok": false,
                 "error": "The T3 Code reader stopped (exit " + exitCode + "). Restarting…",
                 "errorCode": "backend",
@@ -121,7 +143,9 @@ PluginComponent {
                     "attention": 0,
                     "running": 0
                 }
-            });
+            };
+            if (!root.liveInbox)
+                root.publishInbox();
             restartTimer.interval = Math.min(30000, 1000 * Math.pow(2, root.restarts));
             root.restarts += 1;
             restartTimer.restart();
@@ -165,7 +189,7 @@ PluginComponent {
         }
     }
 
-    // ----- live Limits connection -----
+    // ----- live connection -----
 
     function liveCommandLine() {
         const cmd = ["python3", "-I", root.liveScriptPath];
@@ -182,11 +206,41 @@ PluginComponent {
         if (!command || !command.cmd)
             return;
         pluginService.setGlobalVar(pluginId, "liveCommand", null);
-        if (!liveProcess.running)
+        if (!liveProcess.running) {
+            // A usage request still gets a reply, so the widget reads the usage cache instead.
+            if (command.cmd === "usage")
+                root.publishUsage({
+                    "period": command.period,
+                    "seq": command.seq,
+                    "report": null,
+                    "error": "Not connected."
+                });
             return;
-        const message = Object.assign({}, command);
-        delete message.seq;
-        liveProcess.write(JSON.stringify(message) + "\n");
+        }
+        liveProcess.write(JSON.stringify(command) + "\n");
+    }
+
+    function publishUsage(reply) {
+        reply.receivedAt = Date.now();
+        if (pluginService)
+            pluginService.setGlobalVar(pluginId, "usageLive", reply);
+    }
+
+    function handleLiveLine(message) {
+        if (message.kind === "limits") {
+            if (root.pluginService)
+                root.pluginService.setGlobalVar(root.pluginId, "limitsLive", message.view);
+        } else if (message.kind === "inbox") {
+            const snapshot = message.snapshot || null;
+            if (snapshot)
+                snapshot.receivedAt = Date.now();
+            if (!snapshot && !root.liveInbox)
+                return;
+            root.liveInbox = snapshot;
+            root.publishInbox();
+        } else if (message.kind === "usage") {
+            root.publishUsage(message);
+        }
     }
 
     onClock24Changed: {
@@ -206,16 +260,15 @@ PluginComponent {
         stdout: SplitParser {
             splitMarker: "\n"
             onRead: line => {
-                let view;
+                let message;
                 try {
-                    view = JSON.parse(line);
+                    message = JSON.parse(line);
                 } catch (e) {
-                    console.warn("t3codeBar: bad limits view", e);
+                    console.warn("t3codeBar: bad live message", e);
                     return;
                 }
                 root.liveRestarts = 0;
-                if (root.pluginService)
-                    root.pluginService.setGlobalVar(root.pluginId, "limitsLive", view);
+                root.handleLiveLine(message);
             }
         }
 
@@ -226,6 +279,10 @@ PluginComponent {
         // An unremembered token lives only in this process, so a restart needs a new pairing,
         // as when the macOS app quits.
         onExited: (exitCode, exitStatus) => {
+            if (root.liveInbox) {
+                root.liveInbox = null;
+                root.publishInbox();
+            }
             liveRestartTimer.interval = Math.min(30000, 2000 * Math.pow(2, root.liveRestarts));
             root.liveRestarts += 1;
             liveRestartTimer.restart();

@@ -3,7 +3,8 @@ import qs.Common
 import qs.DCommon.Widgets
 
 // The live connection to the local T3 server (LimitsConnectionView in the macOS app):
-// its status, and a form to pair with a new read-only code.
+// its status, and a form to pair with a new read-only code. The connection also
+// feeds the thread list and, with the usage scope, the Cost and Tokens tabs.
 Column {
     id: panel
 
@@ -31,8 +32,16 @@ Column {
     function headline() {
         if (!live)
             return "";
-        if (connected)
-            return "Live from T3 Code" + (live.lastUpdatedAgo ? " · updated " + live.lastUpdatedAgo : "");
+        if (connected) {
+            const parts = [];
+            if (live.threads)
+                parts.push("threads");
+            parts.push("limits");
+            if (live.usage)
+                parts.push("cost and tokens");
+            const list = parts.length > 1 ? parts.slice(0, -1).join(", ") + " and " + parts[parts.length - 1] : parts[0];
+            return "Live from T3 Code: " + list + (live.lastUpdatedAgo ? " · updated " + live.lastUpdatedAgo : "");
+        }
         if (live.retained)
             return "Disconnected · showing data from " + (live.lastUpdatedAgo || "earlier") + " and saved checks";
         return live.text;
@@ -125,7 +134,7 @@ Column {
         StyledText {
             width: parent.width
             wrapMode: Text.WordWrap
-            text: "In T3 Code: Settings → Connections → Authorized clients → Create link. Under Permissions keep only View environment, then copy the code."
+            text: "In T3 Code: Settings → Connections → Authorized clients → Create link. Under Permissions keep only View environment, plus View diagnostics and usage for live cost and tokens, then copy the code."
             font.pixelSize: Theme.fontSizeSmall
             color: Theme.surfaceVariantText
         }

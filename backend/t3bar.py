@@ -530,8 +530,6 @@ def sort_key_cmp(a: dict, b: dict) -> int:
 
 
 def fetch_threads(base: str) -> list[dict]:
-    import functools
-
     conn = open_db(base)
     try:
         conn.row_factory = sqlite3.Row
@@ -553,49 +551,64 @@ def fetch_threads(base: str) -> list[dict]:
     now = now_ms()
     items = []
     for raw in rows:
-        row = dict(raw)
-        if row["thread_id"] is None or row["title"] is None or row["project_id"] is None:
-            raise ReadError("invalidData")
-        created = parse_date(row["created_at"])
-        updated = parse_date(row["updated_at"])
-        if created is None or updated is None:
-            raise ReadError("invalidData")
-        status, hidden = derive_status(row, now)
-        if hidden:
-            continue
-        history = [p.strip() for p in (row["provider_history"] or "").split(",") if p.strip()]
-        if not history and row["model_name"]:
-            history = [row["model_name"]]
-        active_started = parse_date(row["active_run_started_at"])
-        latest_started = parse_date(row["latest_run_started_at"])
-        completed = parse_date(row["latest_run_completed_at"])
-        if status in RUNNING:
-            started = active_started or latest_started or updated
-        elif status == "waiting":
-            started = completed
-        else:
-            started = None
-        branch = (row["branch"] or "").strip()
-        items.append({
-            "id": row["thread_id"],
-            "title": row["title"],
-            "projectTitle": row["project_title"],
-            "badge": project_badge(row["project_title"], row["project_icon_json"], row["favicon_path"], row["workspace_root"]),
-            "branch": branch,
-            "isPinned": bool(row["is_pinned"]),
-            "prNumber": row["pr_number"],
-            "providers": provider_kinds(history),
-            "status": status,
-            "statusSince": started,
-            "limitResetAt": row.get("_reset_at") if status == "limited" else None,
-            "completedAt": completed,
-            "lastActivityAt": parse_date(row["latest_user_message_at"]) or updated,
-            "createdAt": created,
-            "updatedAt": updated,
-            "_pin": row["pin_order_key"],
-            "_active": row["active_order_key"],
-            "_unsettled": parse_date(row["unsettled_at"]),
-        })
+        item = thread_item(dict(raw), now)
+        if item is not None:
+            items.append(item)
+    return sort_threads(items)
+
+
+def thread_item(row: dict, now: float) -> dict | None:
+    """One inbox row from the columns of `thread_query`. None when a snooze hides it.
+
+    The live connection builds the same columns from T3's thread shells, so both
+    sources share the status rules."""
+    if row["thread_id"] is None or row["title"] is None or row["project_id"] is None:
+        raise ReadError("invalidData")
+    created = parse_date(row["created_at"])
+    updated = parse_date(row["updated_at"])
+    if created is None or updated is None:
+        raise ReadError("invalidData")
+    status, hidden = derive_status(row, now)
+    if hidden:
+        return None
+    history = [p.strip() for p in (row["provider_history"] or "").split(",") if p.strip()]
+    if not history and row["model_name"]:
+        history = [row["model_name"]]
+    active_started = parse_date(row["active_run_started_at"])
+    latest_started = parse_date(row["latest_run_started_at"])
+    completed = parse_date(row["latest_run_completed_at"])
+    if status in RUNNING:
+        started = active_started or latest_started or updated
+    elif status == "waiting":
+        started = completed
+    else:
+        started = None
+    branch = (row["branch"] or "").strip()
+    return {
+        "id": row["thread_id"],
+        "title": row["title"],
+        "projectTitle": row["project_title"],
+        "badge": project_badge(row["project_title"], row["project_icon_json"], row["favicon_path"], row["workspace_root"]),
+        "branch": branch,
+        "isPinned": bool(row["is_pinned"]),
+        "prNumber": row["pr_number"],
+        "providers": provider_kinds(history),
+        "status": status,
+        "statusSince": started,
+        "limitResetAt": row.get("_reset_at") if status == "limited" else None,
+        "completedAt": completed,
+        "lastActivityAt": parse_date(row["latest_user_message_at"]) or updated,
+        "createdAt": created,
+        "updatedAt": updated,
+        "_pin": row["pin_order_key"],
+        "_active": row["active_order_key"],
+        "_unsettled": parse_date(row["unsettled_at"]),
+    }
+
+
+def sort_threads(items: list[dict]) -> list[dict]:
+    import functools
+
     items.sort(key=functools.cmp_to_key(sort_key_cmp))
     for item in items:
         for key in ("_pin", "_active", "_unsettled"):
@@ -1590,10 +1603,7 @@ def build_report(dataset: dict, window: dict, prices) -> dict:
                             first_file[s] = index
             index += 1
 
-    if window["hourly"]:
-        columns = [{"start": window["since"] + i * HOUR_MS, "byProvider": {}} for i in range(24)]
-    else:
-        columns = [{"day": d, "start": day_start_ms(d), "byProvider": {}} for d in range(window["sinceDay"], window["untilDay"] + 1)]
+    columns = report_columns(window)
 
     buckets, bucket_index = [], {}
     seen = set()
@@ -1660,6 +1670,21 @@ def build_report(dataset: dict, window: dict, prices) -> dict:
                     bucket["unpriced"] += 1
         if sessions:
             provider_sessions[kind] = provider_sessions.get(kind, 0) + len(sessions)
+
+    return finish_report(buckets, columns, provider_sessions, window["hourly"], duplicates=duplicates,
+                         rejected=dataset["rejected"], malformed=malformed)
+
+
+def report_columns(window: dict) -> list[dict]:
+    if window["hourly"]:
+        return [{"start": window["since"] + i * HOUR_MS, "byProvider": {}} for i in range(24)]
+    return [{"day": d, "start": day_start_ms(d), "byProvider": {}} for d in range(window["sinceDay"], window["untilDay"] + 1)]
+
+
+def finish_report(buckets: list[dict], columns: list[dict], provider_sessions: dict, hourly: bool,
+                  duplicates: int = 0, rejected: int = 0, malformed: int = 0) -> dict:
+    """Totals, providers, models and chart of the Cost and Tokens tabs (UsageReport), from
+    (day or hour, provider, model) buckets."""
 
     def empty_tokens():
         return {"uncached": 0, "cached": 0, "creation": 0, "output": 0, "reasoning": 0}
@@ -1729,11 +1754,106 @@ def build_report(dataset: dict, window: dict, prices) -> dict:
         "cost": cost, "processed": processed(totals), "tokens": totals,
         "cacheHit": (totals["cached"] / input_total) if input_total > 0 else None,
         "cacheSavings": savings, "costByType": by_type, "costBySpeed": by_speed,
-        "providers": provider_list, "models": model_list, "chart": chart, "hourly": window["hourly"],
+        "providers": provider_list, "models": model_list, "chart": chart, "hourly": hourly,
         "sessions": sum(provider_sessions.values()), "records": records, "unpriced": unpriced,
         "unpricedShare": (unpriced / records) if records else 0.0, "duplicatesDropped": duplicates,
-        "rejectedFiles": dataset["rejected"], "malformed": malformed,
+        "rejectedFiles": rejected, "malformed": malformed,
     }
+
+
+def usage_request(days: int, now: float, time_zone: str) -> tuple[dict, dict]:
+    """The `server.getUsageSummary` input T3 Code's Usage page sends for a period, and the
+    window its buckets are laid out in. The past 24 hours are hourly, from the last minute."""
+    window = make_window(days, now)
+
+    def day(index: int) -> str:
+        return (datetime(1970, 1, 1) + timedelta(days=index)).strftime("%Y-%m-%d")
+
+    request = {"sinceDay": day(window["sinceDay"]), "untilDay": day(window["untilDay"]), "timeZone": time_zone,
+               "resolution": "hour" if window["hourly"] else "day"}
+    if window["hourly"]:
+        def iso(ms: float) -> str:
+            return datetime.fromtimestamp(ms / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + f"{int(ms % 1000):03d}Z"
+
+        request.update(sinceTime=iso(window["since"]), untilTime=iso(window["until"]))
+    return request, window
+
+
+def report_from_summary(summary, window: dict) -> dict:
+    """The Cost and Tokens tabs from the local T3 server's usage summary: the same buckets
+    T3 Code's Usage page draws, already priced by the server."""
+    if not isinstance(summary, dict) or not isinstance(summary.get("buckets"), list):
+        raise ValueError("unsupported summary")
+    columns = report_columns(window)
+    buckets, index = [], {}
+    for raw in summary["buckets"]:
+        if not isinstance(raw, dict) or not isinstance(raw.get("provider"), str) or not isinstance(raw.get("model"), str):
+            continue
+        totals = raw.get("totals") if isinstance(raw.get("totals"), dict) else {}
+        tokens = {field: int(totals[key]) if is_num(totals.get(key)) and totals[key] >= 0 else 0
+                  for field, key in (("uncached", "uncachedInputTokens"), ("cached", "cachedInputTokens"),
+                                     ("creation", "cacheCreationTokens"), ("output", "outputTokens"),
+                                     ("reasoning", "reasoningTokens"))}
+        if window["hourly"]:
+            start = parse_date(raw.get("hourStart"))
+            if start is None:
+                continue
+            column = int((start - window["since"]) // HOUR_MS)
+            key = (column, raw["provider"], raw["model"])
+        else:
+            try:
+                parsed = datetime.strptime(str(raw.get("day")), "%Y-%m-%d")
+            except ValueError:
+                continue
+            column = (parsed - datetime(1970, 1, 1)).days - window["sinceDay"]
+            key = (column, raw["provider"], raw["model"])
+        if not 0 <= column < len(columns):
+            continue
+
+        def amount(name):
+            value = raw.get(name)
+            return float(value) if is_num(value) and math.isfinite(value) else 0.0
+
+        cost = amount("costUsd")
+        processed_tokens = tokens["uncached"] + tokens["cached"] + tokens["creation"] + tokens["output"]
+        chart_amount = columns[column]["byProvider"].setdefault(raw["provider"], {"cost": 0.0, "tokens": 0})
+        chart_amount["cost"] += cost
+        chart_amount["tokens"] += processed_tokens
+        # Buckets per transcript file fold into one per (slot, provider, model), as in the cache report.
+        if key not in index:
+            index[key] = len(buckets)
+            buckets.append({"kind": raw["provider"], "model": raw["model"], "uncached": 0, "cached": 0, "creation": 0,
+                            "output": 0, "reasoning": 0, "cost": 0.0, "savings": 0.0, "cats": None,
+                            "fast": 0.0, "ultrafast": 0.0, "premium": 0.0, "records": 0, "unpriced": 0})
+        bucket = buckets[index[key]]
+        for field, value in tokens.items():
+            bucket[field] += value
+        bucket["cost"] += cost
+        bucket["savings"] += amount("cacheSavingsUsd")
+        cats = raw.get("categoryCostUsd")
+        if isinstance(cats, dict):
+            total = bucket["cats"] or {"input": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "output": 0.0}
+            for field in total:
+                value = cats.get(field)
+                total[field] += float(value) if is_num(value) and math.isfinite(value) else 0.0
+            bucket["cats"] = total
+        bucket["fast"] += amount("fastCostUsd")
+        bucket["ultrafast"] += amount("ultrafastCostUsd")
+        bucket["premium"] += amount("speedPremiumUsd")
+        bucket["records"] += int(raw["records"]) if is_num(raw.get("records")) else 0
+        bucket["unpriced"] += int(raw["unpricedRecords"]) if is_num(raw.get("unpricedRecords")) else 0
+
+    # Bucket session counts double-count sessions that span days or models; sources count them once.
+    sessions, skipped, malformed = {}, 0, 0
+    for source in summary.get("sources") or []:
+        if not isinstance(source, dict):
+            continue
+        provider = (source.get("fingerprint") or {}).get("provider") if isinstance(source.get("fingerprint"), dict) else None
+        if isinstance(provider, str) and is_num(source.get("distinctSessions")):
+            sessions[provider] = sessions.get(provider, 0) + int(source["distinctSessions"])
+        skipped += int(source["skippedFiles"]) if is_num(source.get("skippedFiles")) else 0
+        malformed += int(source["malformedRecords"]) if is_num(source.get("malformedRecords")) else 0
+    return finish_report(buckets, columns, sessions, window["hourly"], rejected=skipped, malformed=malformed)
 
 
 def usage(base: str, days: int) -> dict:

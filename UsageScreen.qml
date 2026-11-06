@@ -15,6 +15,9 @@ Column {
     readonly property var limits: host.limitsLive || polledLimits
     property bool loadingReport: false
     property bool loadingLimits: false
+    // The live usage request in flight, and why the last one fell back to the cache.
+    property real pendingUsageSeq: 0
+    property string liveUsageNote: ""
     property bool showAllModels: false
     property int hoverColumn: -1
 
@@ -24,15 +27,41 @@ Column {
 
     spacing: Theme.spacingM
 
+    // Live from the server when the pairing allows it, otherwise from T3 Code's usage cache.
     function refreshReport() {
         loadingReport = true;
         const period = host.usagePeriod;
-        host.backend("usage", ["usage", "--period", String(period)], data => {
-            loadingReport = false;
-            // A failed read keeps the last numbers, as T3 Code Bar does while the cache is rewritten.
-            if (data && (data.state !== "busy" || !report) && period === host.usagePeriod)
-                report = data;
-        });
+        if (host.liveUsage) {
+            pendingUsageSeq = host.requestLiveUsage(period);
+            liveUsageTimeout.restart();
+            return;
+        }
+        pendingUsageSeq = 0;
+        liveUsageNote = "";
+        readCachedReport(period);
+    }
+
+    function readCachedReport(period) {
+        host.backend("usage", ["usage", "--period", String(period)], data => acceptReport(period, data));
+    }
+
+    function acceptReport(period, data) {
+        loadingReport = false;
+        // A failed read keeps the last numbers, as T3 Code Bar does while the cache is rewritten.
+        if (data && (data.state !== "busy" || !report) && period === host.usagePeriod)
+            report = data;
+    }
+
+    Timer {
+        id: liveUsageTimeout
+        interval: 70000
+        onTriggered: {
+            if (!usage.pendingUsageSeq)
+                return;
+            usage.pendingUsageSeq = 0;
+            usage.liveUsageNote = "T3 Code did not answer in time.";
+            usage.readCachedReport(usage.host.usagePeriod);
+        }
     }
 
     function refreshLimits() {
@@ -62,6 +91,20 @@ Column {
             usage.report = null;
             usage.showAllModels = false;
             usage.refreshReport();
+        }
+        function onUsageLiveChanged() {
+            const reply = usage.host.usageLive;
+            if (!reply || !usage.pendingUsageSeq || reply.seq !== usage.pendingUsageSeq)
+                return;
+            liveUsageTimeout.stop();
+            usage.pendingUsageSeq = 0;
+            if (reply.report) {
+                usage.liveUsageNote = "";
+                usage.acceptReport(reply.period, reply.report);
+            } else {
+                usage.liveUsageNote = reply.error || "";
+                usage.readCachedReport(reply.period);
+            }
         }
     }
 
@@ -488,11 +531,20 @@ Column {
                         if (!usage.reportReady)
                             return "";
                         const lines = [];
-                        if (usage.report.rejectedFiles > 0)
-                            lines.push(usage.report.rejectedFiles + " cache entries could not be read; totals may read low.");
-                        if (usage.report.malformed > 0)
-                            lines.push(usage.report.malformed + " transcript lines could not be read.");
-                        lines.push("Transcript cache updated " + usage.report.cacheAge + ". Costs are API estimates from T3 Code's price list, not what a plan bills.");
+                        const report = usage.report;
+                        const connection = usage.host.limitsLive ? usage.host.limitsLive.live : null;
+                        if (report.rejectedFiles > 0)
+                            lines.push(report.rejectedFiles + (report.live ? " transcript files were skipped" : " cache entries could not be read") + "; totals may read low.");
+                        if (report.malformed > 0)
+                            lines.push(report.malformed + " transcript lines could not be read.");
+                        if (report.live) {
+                            lines.push("Live from T3 Code, read " + report.cacheAge + "." + (report.refreshing ? " T3 Code is rescanning transcripts; newer numbers follow on the next refresh." : ""));
+                        } else {
+                            if (connection && connection.connected)
+                                lines.push(usage.liveUsageNote ? "Live usage unavailable: " + usage.liveUsageNote : "Pair with View diagnostics and usage for live cost and tokens.");
+                            lines.push("Transcript cache updated " + report.cacheAge + ".");
+                        }
+                        lines.push("Costs are API estimates from T3 Code's price list, not what a plan bills.");
                         return lines.join("\n");
                     }
                 }

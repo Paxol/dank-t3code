@@ -34,10 +34,16 @@ PluginComponent {
         varName: "inbox"
         defaultValue: null
     }
-    // The Limits tab rendered by the live connection, and the commands sent to it.
+    // The Limits tab rendered by the live connection, its replies to usage
+    // requests, and the commands sent to it.
     PluginGlobalVar {
         id: limitsLiveVar
         varName: "limitsLive"
+        defaultValue: null
+    }
+    PluginGlobalVar {
+        id: usageLiveVar
+        varName: "usageLive"
         defaultValue: null
     }
     PluginGlobalVar {
@@ -53,11 +59,27 @@ PluginComponent {
 
     readonly property var inbox: inboxVar.value
     readonly property var limitsLive: limitsLiveVar.value
+    readonly property var usageLive: usageLiveVar.value
+    // Cost and tokens come from the server when the pairing includes View diagnostics and usage.
+    readonly property bool liveUsage: !!limitsLive && !!limitsLive.live && !!limitsLive.live.usage
 
     function sendLiveCommand(command) {
         liveCommandVar.set(Object.assign({
             "seq": Date.now()
         }, command));
+    }
+
+    property int usageSeq: 0
+    // Returns the request's seq; the reply in usageLive carries it back.
+    function requestLiveUsage(period) {
+        usageSeq += 1;
+        const seq = Date.now() * 1000 + usageSeq % 1000;
+        sendLiveCommand({
+            "cmd": "usage",
+            "period": period,
+            "seq": seq
+        });
+        return seq;
     }
     readonly property bool loading: !inbox
     readonly property var threads: inbox ? (inbox.threads || []) : []

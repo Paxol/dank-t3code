@@ -1,28 +1,42 @@
 #!/usr/bin/env python3
-"""Live Limits connection to the local T3 Code server, ported from T3 Code Bar's
-LimitsLiveConnection (macOS).
+"""Live connection to the local T3 Code server. The Limits part is ported from
+T3 Code Bar's LimitsLiveConnection (macOS); threads and usage follow the same
+RPCs T3 Code's own sidebar and Usage page use.
 
-This is the source T3 Code's own Usage page uses: the `subscribeServerConfig`
-RPC stream, with provider snapshots and CLI Proxy pooled accounts.
+    - Limits: the `subscribeServerConfig` stream, with provider snapshots and
+      CLI Proxy pooled accounts (`orchestration:read`).
+    - Threads: the `orchestration.subscribeShell` stream of thread shells
+      (`orchestration:read`).
+    - Cost and tokens: `server.getUsageSummary`, the server's priced usage
+      buckets (`diagnostics:read`, optional).
 
-    1. The user creates a pairing code in T3 Code with only "View environment"
-       (`orchestration:read`) and gives it to the widget.
+    1. The user creates a pairing code in T3 Code with "View environment"
+       (`orchestration:read`) and, for live cost and tokens, "View diagnostics
+       and usage" (`diagnostics:read`), and gives it to the widget.
     2. The code is exchanged at loopback `/oauth/token` for a DPoP-bound access
-       token with exactly that scope. The pairing code is never stored.
+       token with at most those two scopes. The pairing code is never stored.
     3. A WebSocket ticket is issued with that token, the socket opens at
-       `ws://127.0.0.1:<port>/ws`, and the widget subscribes to the server config.
+       `ws://127.0.0.1:<port>/ws`, and the widget subscribes to the server config
+       and the thread shells.
     4. Only "Remember" stores the widget's own token and key, in the desktop
        keyring (secret-tool). Nothing else is persisted.
 
-The process reads JSON commands on stdin and prints the rendered Limits tab as
-one JSON line whenever it changes. Without a connection, or during an outage,
-it falls back to T3 Code's saved provider files, as the original app does.
+The process reads JSON commands on stdin and prints one JSON line per change:
+
+  {"kind": "limits", "view": {...}}         the rendered Limits tab
+  {"kind": "inbox", "snapshot": {...}}      the thread inbox, or null while not live
+  {"kind": "usage", "period": 7, ...}       a reply to a usage command
+
+Without a connection, or during an outage, the Limits tab falls back to T3 Code's
+saved provider files, as the original app does, and the widget falls back to its
+own readers of `statev2.sqlite` and the usage cache.
 
 Commands:
   {"cmd": "pair", "port": 3773, "code": "...", "remember": false}
   {"cmd": "reconnectSaved", "port": 3773}
   {"cmd": "disconnect"}
   {"cmd": "clock", "twentyFour": true}
+  {"cmd": "usage", "period": 30, "seq": 1}
   {"cmd": "refresh"}
 """
 
@@ -57,7 +71,9 @@ try:
 except ImportError:  # pragma: no cover - reported to the user instead
     HAVE_CRYPTO = False
 
-REQUEST_ID = 0
+REQUEST_ID = 0  # subscribeServerConfig
+SHELL_ID = 1  # orchestration.subscribeShell
+FIRST_USAGE_ID = 2  # each server.getUsageSummary call takes the next id
 SUBSCRIBE = {
     "_tag": "Request", "id": REQUEST_ID, "tag": "subscribeServerConfig",
     "payload": {"usageLimitSources": True, "workspaceSnapshotsOnDemand": True}, "headers": [],
@@ -65,8 +81,12 @@ SUBSCRIBE = {
 ACK = {"_tag": "Ack", "requestId": REQUEST_ID}
 INTERRUPT = {"_tag": "Interrupt", "requestId": REQUEST_ID, "interruptors": []}
 PING = {"_tag": "Ping"}
-MAX_MESSAGE = 8 * 1024 * 1024
+READ_SCOPE = "orchestration:read"
+USAGE_SCOPE = "diagnostics:read"
+REQUESTED_SCOPES = [READ_SCOPE, USAGE_SCOPE]
+MAX_MESSAGE = 32 * 1024 * 1024  # a thread shell snapshot lists every active thread
 RETRY_SECONDS = 3
+USAGE_TIMEOUT_SECONDS = 60
 LIVE_FOOTNOTE = ("Live from the local T3 Code server, as T3 Code's Usage page shows it. "
                  "Read-only; this widget never contacts a provider.")
 STATUS_TEXT = {
@@ -109,6 +129,15 @@ def valid_port(port) -> int:
     return port
 
 
+def valid_scopes(scopes) -> list[str]:
+    """The read scope, optionally with usage. Anything that can change the environment is refused."""
+    if not isinstance(scopes, list) or not all(isinstance(scope, str) for scope in scopes):
+        raise LiveError("authorization")
+    if READ_SCOPE not in scopes or len(set(scopes)) != len(scopes) or not set(scopes) <= set(REQUESTED_SCOPES):
+        raise LiveError("authorization")
+    return [scope for scope in REQUESTED_SCOPES if scope in scopes]
+
+
 # ---------------------------------------------------------------------------
 # DPoP (LimitsDPoP.swift): a proof binds the access token to the widget's key.
 # It does not authenticate the server.
@@ -145,7 +174,7 @@ class DPoP:
 
 # ---------------------------------------------------------------------------
 # Credential store: the desktop keyring through secret-tool. Only the widget's
-# own exchanged token, its port, expiry and private key are stored.
+# own exchanged token, its port, expiry, scopes and private key are stored.
 # ---------------------------------------------------------------------------
 
 KEYRING_ATTRIBUTES = ["service", "t3codebar.limits", "account", "local-read-only"]
@@ -166,9 +195,11 @@ class KeyringStore:
             return None
         try:
             data = json.loads(result.stdout)
+            # Tokens saved before usage was live carry only the read scope.
             return {
                 "port": valid_port(data["port"]), "token": str(data["token"]),
                 "expiresAt": float(data["expiresAt"]), "privateKey": base64.b64decode(data["privateKey"]),
+                "scopes": valid_scopes(data.get("scopes", [READ_SCOPE])),
             }
         except (ValueError, KeyError, TypeError, LiveError) as error:
             raise LiveError("storage") from error
@@ -179,6 +210,7 @@ class KeyringStore:
         secret = json.dumps({
             "port": credential["port"], "token": credential["token"], "expiresAt": credential["expiresAt"],
             "privateKey": base64.b64encode(credential["privateKey"]).decode("ascii"),
+            "scopes": credential.get("scopes", [READ_SCOPE]),
         })
         try:
             result = subprocess.run([self.tool, "store", "--label=T3 Code Bar Limits", *KEYRING_ATTRIBUTES],
@@ -386,8 +418,29 @@ def rpc_frames(text: str) -> list[dict]:
     return frames
 
 
+def request_key(value) -> int | None:
+    """Effect RPC echoes the request id as sent, a number here, or as its string form."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
 def is_request_id(value) -> bool:
-    return (isinstance(value, int) and not isinstance(value, bool) and value == REQUEST_ID) or value == str(REQUEST_ID)
+    return request_key(value) == REQUEST_ID
+
+
+def shell_request(options: dict) -> dict:
+    """Subscribe to thread shells. Idle subagents and older settled threads never reach the
+    inbox, so servers that can leave them out are asked to."""
+    payload = {}
+    if options.get("shellThreadFamilies") is True:
+        payload["omitIdleSubagents"] = True
+        if options.get("shellOlderSettled") is True:
+            payload["omitOlderSettled"] = True
+    return {"_tag": "Request", "id": SHELL_ID, "tag": "orchestration.subscribeShell", "payload": payload,
+            "headers": []}
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +453,7 @@ class LiveData:
         self.providers: list[dict] = []
         self.sources: list[dict] = []
         self.notices: list[str] = []
+        self.shell_options: dict = {}
 
     def copy(self) -> "LiveData":
         other = LiveData()
@@ -415,6 +469,7 @@ class LiveData:
             if not isinstance(config, dict) or not isinstance(config.get("providers"), list):
                 raise LiveError("protocolMismatch")
             self.providers = self._providers(config["providers"])
+            self.shell_options = {key: config.get(key) for key in ("shellThreadFamilies", "shellOlderSettled")}
             if "usageLimitSources" in config and config["usageLimitSources"] is not None:
                 self._sources(config["usageLimitSources"])
             return True
@@ -475,6 +530,179 @@ class LiveData:
 
 
 # ---------------------------------------------------------------------------
+# Thread shells (orchestration.subscribeShell)
+# ---------------------------------------------------------------------------
+
+
+class ShellState:
+    """Active thread shells and projects, kept current from the shell stream."""
+
+    def __init__(self):
+        self.threads: dict[str, dict] = {}
+        self.projects: dict[str, dict] = {}
+        self.ready = False
+
+    def copy(self) -> "ShellState":
+        other = ShellState()
+        other.threads, other.projects, other.ready = dict(self.threads), dict(self.projects), self.ready
+        return other
+
+    def apply(self, item) -> bool:
+        """False for items that carry nothing the inbox shows. Malformed items are skipped:
+        a newer server's shell must not take the Limits stream down with it."""
+        if not isinstance(item, dict):
+            return False
+        kind = item.get("kind")
+        if kind == "snapshot":
+            snapshot = item.get("snapshot")
+            if not isinstance(snapshot, dict) or not isinstance(snapshot.get("threads"), list):
+                return False
+            self.threads = {t["id"]: t for t in snapshot["threads"] if isinstance(t, dict) and isinstance(t.get("id"), str)}
+            projects = snapshot.get("projects") if isinstance(snapshot.get("projects"), list) else []
+            self.projects = {p["id"]: p for p in projects if isinstance(p, dict) and isinstance(p.get("id"), str)}
+            self.ready = True
+            return True
+        if kind == "thread.updated":
+            thread = item.get("thread")
+            if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
+                return False
+            if item.get("location") == "active":
+                self.threads[thread["id"]] = thread
+            else:
+                self.threads.pop(thread["id"], None)  # archived
+            return True
+        if kind == "thread.removed":
+            if item.get("location") == "active" and isinstance(item.get("threadId"), str):
+                return self.threads.pop(item["threadId"], None) is not None
+            return False
+        if kind == "project.updated":
+            project = item.get("project")
+            if not isinstance(project, dict) or not isinstance(project.get("id"), str):
+                return False
+            self.projects[project["id"]] = project
+            return True
+        if kind == "project.removed":
+            if isinstance(item.get("projectId"), str):
+                return self.projects.pop(item["projectId"], None) is not None
+            return False
+        return False  # "synchronized" and kinds a newer server adds
+
+    def items(self, now: float) -> list[dict]:
+        items = []
+        for thread in self.threads.values():
+            row = shell_row(thread, self.projects)
+            if row is None:
+                continue
+            try:
+                item = t3bar.thread_item(row, now)
+            except (t3bar.ReadError, TypeError, ValueError):
+                continue
+            if item is not None:
+                items.append(item)
+        return t3bar.sort_threads(items)
+
+
+def _text(value) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def shell_pr_number(thread: dict):
+    for link in [thread.get("linkedPullRequest"), *(thread.get("pullRequests") or []), thread.get("branchPullRequest")]:
+        if isinstance(link, dict) and link.get("source") != "stack-dismissed":
+            number = link.get("number")
+            if isinstance(number, int) and not isinstance(number, bool):
+                return number
+    return None
+
+
+def shell_row(thread, projects: dict) -> dict | None:
+    """The columns `t3bar.thread_query` reads from statev2.sqlite, from one thread shell. None
+    for rows the inbox leaves out: deleted, archived, settled, subagent and side-chat threads.
+
+    The shell summarizes what the query counts: its one pending request stands for the pending
+    count, and a failed latest run stands for the provider session's error state."""
+    if not isinstance(thread, dict) or not isinstance(thread.get("id"), str) or thread["id"].startswith("thread:"):
+        return None
+    if thread.get("deletedAt") or thread.get("archivedAt") or thread.get("settledAt"):
+        return None
+    lineage = thread.get("lineage") if isinstance(thread.get("lineage"), dict) else {}
+    if lineage.get("sideChat") is True or lineage.get("relationshipToParent") == "subagent":
+        return None
+    project = projects.get(thread.get("projectId")) or {}
+    pending = thread.get("pendingRuntimeRequest") if isinstance(thread.get("pendingRuntimeRequest"), dict) else None
+    status = thread.get("status")
+    latest = status if isinstance(status, str) and status not in ("idle", "queued") else None
+    failure = None
+    if _text(thread.get("lastErrorClass")):
+        failure = json.dumps({"class": thread["lastErrorClass"], "resetAt": thread.get("usageLimitResetAt")})
+    goal = thread.get("goal") if isinstance(thread.get("goal"), dict) else {}
+    model = thread.get("modelSelection") if isinstance(thread.get("modelSelection"), dict) else {}
+    history = [p for p in thread.get("providerInstanceHistory") or [] if isinstance(p, str) and p]
+    if not history and _text(thread.get("providerInstanceId")):
+        history = [thread["providerInstanceId"]]
+    icon = project.get("projectIcon")
+    guests = thread.get("pendingGuestMessageCount")
+    return {
+        "thread_id": thread["id"],
+        "title": thread.get("title") if isinstance(thread.get("title"), str) else None,
+        "project_id": thread.get("projectId") if isinstance(thread.get("projectId"), str) else None,
+        "project_title": _text(project.get("title")) or "No Project",
+        "created_at": thread.get("createdAt"),
+        "updated_at": thread.get("updatedAt"),
+        "active_run_status": thread.get("activityRunStatus"),
+        "active_run_started_at": thread.get("activityRunStartedAt"),
+        "latest_run_status": latest,
+        "latest_run_started_at": thread.get("latestRunStartedAt") or thread.get("latestRunRequestedAt"),
+        "latest_run_completed_at": thread.get("latestRunCompletedAt"),
+        "pending_user_input": 1 if pending and pending.get("kind") == "user_input" else 0,
+        "pending_approval": 1 if pending and pending.get("kind") != "user_input" else 0,
+        "branch": thread.get("branch") if isinstance(thread.get("branch"), str) else None,
+        "worktree_path": thread.get("worktreePath"),
+        "model_name": _text(model.get("model")),
+        "pr_number": shell_pr_number(thread),
+        "is_pinned": 1 if thread.get("pinnedAt") else 0,
+        "snoozed_until": thread.get("snoozedUntil"),
+        "has_goal": 1 if goal.get("status") == "active" else 0,
+        "snoozed_at": thread.get("snoozedAt"),
+        "pin_order_key": _text(thread.get("pinOrderKey")),
+        "active_order_key": _text(thread.get("activeOrderKey")),
+        "provider_history": ",".join(history),
+        "latest_user_message_at": thread.get("latestUserMessageAt"),
+        "project_icon_json": json.dumps(icon) if isinstance(icon, dict) else None,
+        "favicon_path": _text(project.get("faviconPath")),
+        "workspace_root": _text(project.get("workspaceRoot")),
+        "unsettled_at": thread.get("unsettledAt"),
+        "last_visited_at": thread.get("lastVisitedAt"),
+        "session_status": "error" if latest == "failed" else None,
+        "session_updated_at": thread.get("latestRunCompletedAt") or thread.get("updatedAt"),
+        "latest_failure": failure if latest in ("failed", "error") else None,
+        "pending_guest_messages": guests if isinstance(guests, int) and not isinstance(guests, bool) else 0,
+        "has_runs": 1 if thread.get("latestRunId") or thread.get("activeRunId") else 0,
+        "blocked_on_thread_wait": 1 if thread.get("blockedOnThreadWait") is True else 0,
+    }
+
+
+def local_time_zone() -> str:
+    """The IANA zone usage days are bucketed in; T3 refuses fixed offsets across DST."""
+    zone = os.environ.get("TZ", "").lstrip(":").strip()
+    if zone and "/" in zone and not zone.startswith("/") or zone == "UTC":
+        return zone
+    for path in ([zone] if zone.startswith("/") else []) + ["/etc/localtime"]:
+        try:
+            target = os.path.realpath(path)
+        except OSError:
+            continue
+        if "/zoneinfo/" in target:
+            name = target.split("/zoneinfo/", 1)[1]
+            for prefix in ("posix/", "right/"):
+                name = name[len(prefix):] if name.startswith(prefix) else name
+            if name:
+                return name
+    text = (t3bar.read_text("/etc/timezone") or "").strip()
+    return text or "UTC"
+
+
+# ---------------------------------------------------------------------------
 # Connection (LimitsLiveConnection)
 # ---------------------------------------------------------------------------
 
@@ -495,6 +723,9 @@ class LiveConnection:
         self.remembered = False
         self.socket: WebSocket | None = None
         self.worker: threading.Thread | None = None
+        self.shell: ShellState | None = None
+        self.next_usage_id = FIRST_USAGE_ID
+        self.pending_usage: dict[int, dict] = {}
 
     # ----- state -----
 
@@ -517,10 +748,20 @@ class LiveConnection:
             return self.message or "Could not connect to local T3 Code."
         return STATUS_TEXT.get(self.status, self.status)
 
+    def scopes(self) -> list[str]:
+        credential = self.credential
+        return list(credential.get("scopes", [READ_SCOPE])) if credential else []
+
+    def usage_available(self) -> bool:
+        return self.status == "live" and self.socket is not None and USAGE_SCOPE in self.scopes()
+
     def view(self) -> dict:
         with self.lock:
             status, data, last = self.status, self.data, self.last_updated
             credential = self.credential
+            scopes = self.scopes()
+            usage_live = self.usage_available()
+            threads_live = status == "live" and self.shell is not None
         cache, skipped = t3bar.read_cache_records(self.base)
         live_now = data is not None and status == "live"
         if data is None:
@@ -546,8 +787,96 @@ class LiveConnection:
             "remembered": self.remembered,
             "available": HAVE_CRYPTO,
             "keyring": self.store.tool is not None,
+            "scopes": scopes,
+            "threads": threads_live,
+            "usage": usage_live,
         }
         return view
+
+    def inbox(self) -> dict | None:
+        """The thread inbox from the shell stream, in `t3bar.snapshot`'s shape. None while
+        not live, so the widget shows its own reading of statev2.sqlite."""
+        with self.lock:
+            if self.status != "live" or self.shell is None:
+                return None
+            shell, credential = self.shell, self.credential
+        threads = shell.items(t3bar.now_ms())
+        return {
+            "ok": True, "error": None, "errorCode": None, "serverOnline": True,
+            "environmentId": t3bar.environment_id(self.base),
+            "port": credential["port"] if credential else None,
+            "stateDir": self.base, "threads": threads, "live": True,
+            "summary": t3bar.summarize(threads, True), "source": "live",
+        }
+
+    # ----- usage -----
+
+    def usage(self, period, seq) -> None:
+        """Asks the server for one period's usage summary. The reply arrives as a "usage" event;
+        without live usage it carries an error, and the widget reads the usage cache instead."""
+        days = period if period in (1, 7, 30, 90) else 30
+        with self.lock:
+            ws = self.socket if self.usage_available() else None
+            if ws is None:
+                reason = ("The pairing code does not include View diagnostics and usage."
+                          if self.status == "live" else "Not connected.")
+                request_id = None
+            else:
+                request_id = self.next_usage_id
+                self.next_usage_id += 1
+                payload, window = t3bar.usage_request(days, t3bar.now_ms(), local_time_zone())
+                self.pending_usage[request_id] = {"period": days, "seq": seq, "window": window,
+                                                  "sent": time.monotonic()}
+        if request_id is None:
+            self.events.put(("usage", {"period": days, "seq": seq, "report": None, "error": reason}))
+            return
+        try:
+            ws.send_json({"_tag": "Request", "id": request_id, "tag": "server.getUsageSummary",
+                          "payload": payload, "headers": []})
+        except OSError:
+            self._usage_failed(request_id, "The connection dropped.")
+
+    def _usage_failed(self, request_id: int, reason: str) -> None:
+        with self.lock:
+            pending = self.pending_usage.pop(request_id, None)
+        if pending:
+            self.events.put(("usage", {"period": pending["period"], "seq": pending["seq"], "report": None,
+                                       "error": reason}))
+
+    def fail_pending_usage(self, reason: str, older_than: float | None = None) -> None:
+        now = time.monotonic()
+        with self.lock:
+            ids = [i for i, p in self.pending_usage.items() if older_than is None or now - p["sent"] > older_than]
+        for request_id in ids:
+            self._usage_failed(request_id, reason)
+
+    def _usage_reply(self, request_id: int, exit_value) -> None:
+        with self.lock:
+            pending = self.pending_usage.pop(request_id, None)
+        if pending is None:
+            return
+        reply = {"period": pending["period"], "seq": pending["seq"], "report": None, "error": None}
+        if isinstance(exit_value, dict) and exit_value.get("_tag") == "Success":
+            summary = exit_value.get("value")
+            try:
+                report = t3bar.report_from_summary(summary, pending["window"])
+                read_at = t3bar.parse_date(summary.get("readAt")) or t3bar.now_ms()
+                report.update(state="ok", period=pending["period"], live=True, cacheModified=read_at,
+                              cacheAge=t3bar.fmt_ago(read_at, t3bar.now_ms()), version=summary.get("contractVersion"),
+                              refreshing=any(isinstance(s, dict) and s.get("refreshing") is True
+                                             for s in summary.get("sources") or []))
+                reply["report"] = report
+            except (ValueError, TypeError, AttributeError, KeyError):
+                reply["error"] = "This T3 Code version returned an unsupported usage summary."
+        else:
+            text = json.dumps(exit_value)
+            if "EnvironmentAuthorizationError" in text or "missing required scope" in text:
+                reply["error"] = "The pairing code does not include View diagnostics and usage."
+            elif "UsageReadError" in text:
+                reply["error"] = "T3 Code could not read usage. Retrying."
+            else:
+                reply["error"] = "The usage request failed."
+        self.events.put(("usage", reply))
 
     # ----- commands -----
 
@@ -565,8 +894,10 @@ class LiveConnection:
                 ws.close()
             threading.Thread(target=interrupt, daemon=True).start()
         with self.lock:
+            self.shell = None
             if self.credential is not None or self.status in ("connecting", "live", "retrying"):
                 self.status, self.message = "paused", None
+        self.fail_pending_usage("The connection closed.")
 
     def _start(self, target, *args) -> int:
         with self.lock:
@@ -657,8 +988,8 @@ class LiveConnection:
             "subject_token": code,
             "subject_token_type": "urn:t3:params:oauth:token-type:environment-bootstrap",
             "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
-            "scope": "orchestration:read",
-            "client_label": "T3 Code Bar Limits",
+            "scope": " ".join(REQUESTED_SCOPES),
+            "client_label": "T3 Code Bar",
             "client_device_type": "desktop",
             "client_os": "linux",
         }, quote_via=urllib.parse.quote)
@@ -668,14 +999,15 @@ class LiveConnection:
         }, form.encode("ascii"))
         token, seconds = result.get("access_token"), result.get("expires_in")
         scopes = result.get("scope").split() if isinstance(result.get("scope"), str) else None
-        # Only a DPoP-bound token with exactly the read scope is accepted, never a plain bearer token.
+        # Only a DPoP-bound token is accepted, never a plain bearer token. The server grants the
+        # requested scopes the code allows: the read scope, and usage when the code includes it.
         if (result.get("token_type") != "DPoP"
                 or result.get("issued_token_type") != "urn:ietf:params:oauth:token-type:access_token"
-                or scopes != ["orchestration:read"]
                 or not isinstance(token, str) or not token
                 or isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not 0 < seconds < float("inf")):
             raise LiveError("authorization")
-        return {"port": port, "token": token, "expiresAt": time.time() + seconds, "privateKey": signer.raw()}
+        return {"port": port, "token": token, "expiresAt": time.time() + seconds, "privateKey": signer.raw(),
+                "scopes": valid_scopes(scopes)}
 
     def _sleep(self, run: int, seconds: float) -> bool:
         deadline = time.monotonic() + seconds
@@ -719,7 +1051,8 @@ class LiveConnection:
                     ws.close()
                 if self.current(run):
                     with self.lock:
-                        self.socket = None
+                        self.socket, self.shell = None, None
+                    self.fail_pending_usage("The connection closed.")
                     self.set_status(run, "failed", str(error))
                 return
             except (OSError, ValueError, http.client.HTTPException):
@@ -728,7 +1061,8 @@ class LiveConnection:
                 if not self.current(run):
                     return
                 with self.lock:
-                    self.socket = None
+                    self.socket, self.shell = None, None
+                self.fail_pending_usage("The connection dropped.")
                 self.set_status(run, "retrying")
                 if not self._sleep(run, RETRY_SECONDS):
                     return
@@ -736,8 +1070,9 @@ class LiveConnection:
     def _stream(self, run: int, ws: WebSocket, credential: dict) -> None:
         ws.send_json(SUBSCRIBE)
         connected = last_frame = last_ping = time.monotonic()
-        has_snapshot = False
+        has_snapshot = shell_sent = False
         state = LiveData()
+        shell = ShellState()
         while self.current(run):
             now = time.monotonic()
             if now - last_ping >= 5:
@@ -752,8 +1087,18 @@ class LiveConnection:
                 continue
             last_frame = time.monotonic()
             for frame in rpc_frames(text):
-                tag = frame.get("_tag")
+                tag, key = frame.get("_tag"), request_key(frame.get("requestId"))
                 if tag == "Pong":
+                    continue
+                if tag == "Exit" and key is not None and key >= FIRST_USAGE_ID:
+                    self._usage_reply(key, frame.get("exit"))
+                    continue
+                if tag == "Exit" and key == SHELL_ID:
+                    # Threads fall back to statev2.sqlite; the Limits stream stays live.
+                    with self.lock:
+                        if self.current(run):
+                            self.shell = None
+                    self.notify()
                     continue
                 if tag == "Exit":
                     if not self.current(run):
@@ -761,8 +1106,20 @@ class LiveConnection:
                     if "Authorization" in json.dumps(frame.get("exit")):
                         raise LiveError("authorization")
                     raise ConnectionError("stream ended")
-                if tag != "Chunk" or not is_request_id(frame.get("requestId")) or not isinstance(frame.get("values"), list):
+                if tag != "Chunk" or key not in (REQUEST_ID, SHELL_ID) or not isinstance(frame.get("values"), list):
                     raise LiveError("protocolMismatch")
+                if key == SHELL_ID:
+                    changed = False
+                    for value in frame["values"]:
+                        changed = shell.apply(value) or changed
+                    ws.send_json({"_tag": "Ack", "requestId": SHELL_ID})
+                    if changed and shell.ready:
+                        with self.lock:
+                            if not self.current(run):
+                                return
+                            self.shell = shell.copy()
+                        self.notify()
+                    continue
                 changed = False
                 for value in frame["values"]:
                     if isinstance(value, dict) and value.get("type") == "snapshot":
@@ -771,6 +1128,10 @@ class LiveConnection:
                 ws.send_json(ACK)
                 if not self.current(run):
                     return
+                if has_snapshot and not shell_sent:
+                    # The config says which shell options this server understands.
+                    ws.send_json(shell_request(state.shell_options))
+                    shell_sent = True
                 if changed and has_snapshot:
                     with self.lock:
                         if not self.current(run):
@@ -817,15 +1178,29 @@ def main() -> int:
         connection.reconnect_saved(port, quiet=True)
 
     events.put(("render", None))
-    last = None
+    last: dict[str, str | None] = {"limits": None, "inbox": None}
+
+    def emit(kind: str, body: dict, dedupe: bool) -> None:
+        text = json.dumps(dict(kind=kind, **body), separators=(",", ":"), ensure_ascii=False)
+        if dedupe:
+            if text == last[kind]:
+                return
+            last[kind] = text
+        sys.stdout.write(text + "\n")
+        sys.stdout.flush()
+
     while True:
         try:
             kind, payload = events.get(timeout=5)
         except queue.Empty:
-            kind, payload = "render", None  # "Checked 5m ago" and saved files change without an event
+            # "Checked 5m ago", saved files and snooze timers change without an event.
+            kind, payload = "render", None
         if kind == "eof":
             connection.stop()
             return 0
+        if kind == "usage":
+            emit("usage", payload, False)
+            continue
         if kind == "command":
             cmd = payload.get("cmd")
             if cmd == "pair":
@@ -836,17 +1211,15 @@ def main() -> int:
                 connection.disconnect()
             elif cmd == "clock":
                 connection.twenty_four = bool(payload.get("twentyFour", True))
+            elif cmd == "usage":
+                connection.usage(payload.get("period"), payload.get("seq"))
             payload = None  # drop the pairing code as soon as it is handed over
+        connection.fail_pending_usage("T3 Code took too long to read usage.", USAGE_TIMEOUT_SECONDS)
         try:
-            view = connection.view()
+            emit("limits", {"view": connection.view()}, True)
+            emit("inbox", {"snapshot": connection.inbox()}, True)
         except Exception as error:  # noqa: BLE001 - keep the stream alive
             print(f"t3live: render failed: {error}", file=sys.stderr, flush=True)
-            continue
-        text = json.dumps(view, separators=(",", ":"), ensure_ascii=False)
-        if text != last:
-            last = text
-            sys.stdout.write(text + "\n")
-            sys.stdout.flush()
 
 
 if __name__ == "__main__":

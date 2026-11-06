@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""The live Limits connection against a fake T3 server on loopback.
+"""The live connection against a fake T3 server on loopback.
 
 The fake checks what the real server checks: the DPoP proof signature, method,
 URL and access-token hash on every request, the pairing code and scope on the
 token exchange, and the ticket on the WebSocket upgrade. It then streams a
-config snapshot and a CLI Proxy source update, and expects an Ack per chunk.
+config snapshot and a CLI Proxy source update, the thread shells, and answers
+usage summaries when the token has the usage scope. It expects an Ack per chunk.
 No real credentials, keyring or T3 server are used. Run with:
 
     python3 -I tests/test_live.py
@@ -71,10 +72,82 @@ def provider(driver, used, email):
     }
 
 
+NOW = time.time()
+
+
+def iso(offset_seconds):
+    return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(NOW + offset_seconds))
+
+
+def shell(ident, title, **fields):
+    thread = {
+        "id": ident, "projectId": "p1", "title": title, "providerInstanceId": "claudeAgent",
+        "modelSelection": {"provider": "claudeAgent", "model": "claude-opus-4-1"}, "branch": None,
+        "worktreePath": None, "lineage": {"parentThreadId": None, "relationshipToParent": None, "rootThreadId": ident},
+        "latestRunId": "r1", "latestRunStartedAt": iso(-600), "latestRunCompletedAt": iso(-300), "activeRunId": None,
+        "activityRunStatus": None, "activityRunStartedAt": None, "status": "completed", "pendingRuntimeRequest": None,
+        "pendingGuestMessageCount": 0, "latestVisibleMessage": None, "latestUserMessageAt": iso(-700),
+        "providerInstanceHistory": ["claudeAgent"], "goal": None, "itemCount": 3, "visibleItemCount": 3,
+        "createdAt": iso(-3600), "updatedAt": iso(-300), "archivedAt": None, "settledOverride": None, "settledAt": None,
+        "lastVisitedAt": iso(-200), "deletedAt": None,
+    }
+    thread.update(fields)
+    return thread
+
+
+SHELL_SNAPSHOT = {"kind": "snapshot", "snapshot": {
+    "schemaVersion": 2, "snapshotSequence": 10, "archivedThreads": [],
+    "projects": [{"id": "p1", "title": "Bar", "workspaceRoot": "/nowhere/bar", "projectIcon":
+                  {"kind": "monogram", "text": "BR", "color": "teal"}, "scripts": [],
+                  "createdAt": iso(-9000), "updatedAt": iso(-9000)}],
+    "threads": [
+        shell("t-approval", "Needs approval", pendingRuntimeRequest={"id": "q", "kind": "command", "createdAt": iso(-10)}),
+        shell("t-working", "Working", activityRunStatus="running", activityRunStartedAt=iso(-120), status="running",
+              activeRunId="r2", latestRunCompletedAt=None, pullRequests=[{"number": 42, "source": "created"}]),
+        shell("t-limited", "Limited", status="failed", lastErrorClass="usage_limit", usageLimitResetAt=iso(3600)),
+        shell("t-done", "Done", lastVisitedAt=iso(-400)),
+        shell("t-sub", "Subagent", lineage={"parentThreadId": "t-done", "relationshipToParent": "subagent",
+                                            "rootThreadId": "t-done"}, activityRunStatus="running"),
+        shell("t-settled", "Settled", settledAt=iso(-50), settledOverride="settled"),
+        shell("t-orphan", "No project", projectId="gone", latestRunId=None, latestRunCompletedAt=None, status="idle"),
+    ]}}
+
+
+def usage_summary(request):
+    hourly = request.get("resolution") == "hour"
+    bucket = {"day": request["untilDay"], "provider": "claude", "model": "claude-opus-4-1", "sourcePath": "/a.jsonl",
+              "totals": {"uncachedInputTokens": 100, "cachedInputTokens": 900, "cacheCreationTokens": 0,
+                         "outputTokens": 50, "reasoningTokens": 0},
+              "costUsd": 1.5, "cacheSavingsUsd": 0.25,
+              "categoryCostUsd": {"input": 0.5, "cacheRead": 0.25, "cacheWrite": 0, "output": 0.75},
+              "costSource": "modelPriced", "records": 4, "unpricedRecords": 0, "sessions": 1}
+    other = dict(bucket, sourcePath="/b.jsonl", costUsd=0.5, fastCostUsd=0.5, sessions=1)
+    codex = dict(bucket, provider="codex", model="gpt-5", costUsd=2.0, categoryCostUsd=None, records=2, unpricedRecords=2,
+                 costSource="unpriced")
+    if hourly:
+        last_hour = t3live.t3bar.parse_date(request["untilTime"]) - 1800_000
+        start = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(t3live.t3bar.parse_date(request["sinceTime"]) / 1000
+                                                                     + ((last_hour - t3live.t3bar.parse_date(request["sinceTime"])) // 3_600_000) * 3600))
+        for item in (bucket, other, codex):
+            item["hourStart"] = start
+    return {"contractVersion": 1, "readAt": iso(-5), "timeZone": request["timeZone"], "sinceDay": request["sinceDay"],
+            "untilDay": request["untilDay"], "buckets": [bucket, other, codex],
+            "sources": [{"fingerprint": {"hostId": "h", "provider": "claude", "resolvedHomePath": "/h", "volumeId": "1"},
+                         "status": "ok", "scannedFiles": 2, "skippedFiles": 1, "malformedRecords": 3,
+                         "distinctSessions": 1, "message": None},
+                        {"fingerprint": {"hostId": "h", "provider": "codex", "resolvedHomePath": "/h", "volumeId": "1"},
+                         "status": "ok", "scannedFiles": 1, "skippedFiles": 0, "malformedRecords": 0,
+                         "distinctSessions": 1, "message": None}],
+            "pricing": {"status": "fresh", "source": "litellm", "fetchedAt": None, "knownModels": 10},
+            "scanDurationMs": 12}
+
+
 class FakeT3:
-    def __init__(self, token_type="DPoP", scope="orchestration:read"):
-        self.token_type, self.scope = token_type, scope
-        self.acks, self.pings, self.requests = 0, 0, []
+    def __init__(self, token_type="DPoP", scope=None, grants="orchestration:read diagnostics:read"):
+        self.token_type, self.grants = token_type, grants.split()
+        self.scope = scope
+        self.acks, self.shell_acks, self.pings, self.requests = 0, 0, 0, []
+        self.shell_payload, self.usage_requests = None, []
         self.key = None
         fake = self
 
@@ -100,11 +173,13 @@ class FakeT3:
                     form = dict(urllib.parse.parse_qsl(body))
                     if form.get("subject_token") != PAIRING_CODE:
                         return self.reply(401, {"code": "auth_invalid"})
-                    assert form["scope"] == "orchestration:read"
+                    assert form["scope"] == "orchestration:read diagnostics:read", form["scope"]
                     assert form["subject_token_type"] == "urn:t3:params:oauth:token-type:environment-bootstrap"
                     fake.key = jwk
+                    # The server grants the requested scopes the code allows.
+                    granted = fake.scope or " ".join(s for s in form["scope"].split() if s in fake.grants)
                     return self.reply(200, {"access_token": TOKEN, "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
-                                            "token_type": fake.token_type, "expires_in": 3600, "scope": fake.scope})
+                                            "token_type": fake.token_type, "expires_in": 3600, "scope": granted})
                 if self.path == "/api/auth/websocket-ticket/rpc":
                     if self.headers.get("Authorization") != f"DPoP {TOKEN}":
                         return self.reply(401, {"code": "auth_invalid"})
@@ -183,16 +258,36 @@ class FakeT3:
                      "accounts": []}]}}]})
             self.send(sock, [{"_tag": "Chunk", "requestId": rid, "values": [
                 {"version": 1, "type": "snapshot", "config": {"providers": [provider("claudeAgent", 25, "me@example.com")],
-                                                               "settings": {"secret": "ignored"}}},
+                                                               "settings": {"secret": "ignored"},
+                                                               "shellThreadFamilies": True, "shellOlderSettled": True}},
                 {"version": 1, "type": "settingsUpdated", "payload": {"settings": {}}}]}])
             while True:
                 opcode, payload = self.read(sock)
                 if opcode == 0x8:
                     return
                 frame = json.loads(payload)
-                if frame["_tag"] == "Ack":
-                    assert frame["requestId"] == rid
-                    self.acks += 1
+                if frame["_tag"] == "Request" and frame["tag"] == "orchestration.subscribeShell":
+                    self.shell_payload, shell_id = frame["payload"], frame["id"]
+                    self.send(sock, {"_tag": "Chunk", "requestId": shell_id, "values": [SHELL_SNAPSHOT]})
+                    self.send(sock, {"_tag": "Chunk", "requestId": shell_id, "values": [
+                        {"kind": "thread.updated", "sequence": 11, "location": "archive",
+                         "thread": shell("t-done", "Done", archivedAt=iso(-1))},
+                        {"kind": "synchronized"}]})
+                elif frame["_tag"] == "Request" and frame["tag"] == "server.getUsageSummary":
+                    self.usage_requests.append(frame["payload"])
+                    if "diagnostics:read" in self.grants:
+                        exit_value = {"_tag": "Success", "value": usage_summary(frame["payload"])}
+                    else:
+                        exit_value = {"_tag": "Failure", "cause": {"_tag": "Fail", "error": {
+                            "_tag": "EnvironmentAuthorizationError",
+                            "message": "The authenticated token is missing required scope: diagnostics:read."}}}
+                    self.send(sock, {"_tag": "Exit", "requestId": frame["id"], "exit": exit_value})
+                elif frame["_tag"] == "Ack":
+                    if frame["requestId"] == rid:
+                        self.acks += 1
+                    else:
+                        assert frame["requestId"] == shell_id, frame
+                        self.shell_acks += 1
                 elif frame["_tag"] == "Ping":
                     self.pings += 1
                     self.send(sock, {"_tag": "Pong"})
@@ -234,6 +329,20 @@ def make_connection():
     return connection
 
 
+def usage_reply(connection, period, seconds=10):
+    """Sends a usage command and waits for its reply on the event queue."""
+    connection.usage(period, period * 10)
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        try:
+            kind, payload = connection.events.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        if kind == "usage" and payload["seq"] == period * 10:
+            return payload
+    return None
+
+
 def main():
     failures = []
 
@@ -260,6 +369,51 @@ def main():
           connection.store.saved is not None and connection.store.saved["token"] == TOKEN
           and len(connection.store.saved["privateKey"]) == 32)
     check("pairing code never stored", PAIRING_CODE not in json.dumps({**connection.store.saved, "privateKey": ""}))
+    check("token carries the usage scope", connection.credential["scopes"] == ["orchestration:read", "diagnostics:read"]
+          and connection.store.saved["scopes"] == ["orchestration:read", "diagnostics:read"])
+
+    # Threads from the shell stream.
+    check("threads go live", wait_for(connection, lambda c: c.view()["live"]["threads"]))
+    check("shell asks to omit idle subagents and older settled threads",
+          fake.shell_payload == {"omitIdleSubagents": True, "omitOlderSettled": True})
+    check("acks every shell chunk", wait_for(connection, lambda c: fake.shell_acks >= 2))
+    check("archived thread leaves the inbox", wait_for(connection, lambda c: all(
+        t["id"] != "t-done" for t in (c.inbox() or {"threads": [{"id": "t-done"}]})["threads"])))
+    inbox = connection.inbox()
+    by_id = {t["id"]: t for t in inbox["threads"]}
+    check("inbox is live", inbox["live"] and inbox["serverOnline"] and inbox["source"] == "live")
+    check("subagent and settled threads are left out", "t-sub" not in by_id and "t-settled" not in by_id)
+    check("approval from the pending request", by_id["t-approval"]["status"] == "approval")
+    check("working from the active run", by_id["t-working"]["status"] == "working"
+          and by_id["t-working"]["statusSince"] is not None)
+    check("pull request number", by_id["t-working"]["prNumber"] == 42)
+    check("usage limit with its reset", by_id["t-limited"]["status"] == "limited"
+          and by_id["t-limited"]["limitResetAt"] is not None)
+    check("thread without runs waits", by_id["t-orphan"]["status"] == "waiting"
+          and by_id["t-orphan"]["projectTitle"] == "No Project")
+    check("project badge from the shell", by_id["t-approval"]["badge"] == {"kind": "monogram", "text": "BR",
+                                                                             "color": "#2dd4bf"})
+    check("summary from live threads", inbox["summary"]["status"] == "approval" and inbox["summary"]["badge"] == 1)
+
+    # Cost and tokens from the usage summary.
+    week = usage_reply(connection, 7)
+    check("usage reply arrives", week is not None and week["error"] is None and week["report"] is not None)
+    report = week["report"]
+    check("usage request window", fake.usage_requests[0]["resolution"] == "day"
+          and fake.usage_requests[0]["timeZone"] and "sinceTime" not in fake.usage_requests[0])
+    check("usage totals", abs(report["cost"] - 4.0) < 1e-9 and report["processed"] == 3150
+          and report["tokens"]["cached"] == 2700)
+    check("usage is live", report["live"] and report["state"] == "ok" and report["period"] == 7)
+    check("usage providers and models", [p["kind"] for p in report["providers"]] == ["codex", "claude"]
+          and report["models"][0]["name"] == "claude-opus-4-1" and report["models"][1]["unpriced"])
+    check("usage sessions from sources", report["sessions"] == 2)
+    check("usage counts skipped files and bad lines", report["rejectedFiles"] == 1 and report["malformed"] == 3)
+    check("usage chart puts today last", len(report["chart"]) == 7 and sum(v["cost"] for v in report["chart"][-1]["values"]) == 4.0)
+    check("usage cost by speed", abs(report["costBySpeed"]["fast"] - 0.5) < 1e-9)
+    day = usage_reply(connection, 1)
+    check("24h usage is hourly", day is not None and day["report"] is not None and day["report"]["hourly"]
+          and fake.usage_requests[-1]["resolution"] == "hour" and "sinceTime" in fake.usage_requests[-1]
+          and len(day["report"]["chart"]) == 24 and sum(v["cost"] for v in day["report"]["chart"][-1]["values"]) == 4.0)
     check("pings the stream", wait_for(connection, lambda c: fake.pings >= 1, 8))
 
     # Reconnect with the remembered token, as at launch.
@@ -268,8 +422,10 @@ def main():
     check("stop pauses", connection.status == "paused")
     again = make_connection()
     again.store.saved = saved
+    check("stop drops the live inbox", connection.inbox() is None)
     again.reconnect_saved(fake.port, quiet=True)
     check("reconnects with the saved token", wait_for(again, lambda c: c.status == "live"))
+    check("saved token keeps its scopes", again.view()["live"]["usage"])
     check("saved token is not exchanged again", fake.requests.count("/oauth/token") == 1)
     again.disconnect()
     check("disconnect forgets the token", again.status == "cacheOnly" and again.store.saved is None and again.data is None)
@@ -285,6 +441,32 @@ def main():
     expired.store.saved = dict(saved, expiresAt=time.time() - 1)
     expired.reconnect_saved(fake.port)
     check("expired token asks to pair again", expired.status == "failed" and "expired" in expired.message)
+
+    # A code with only View environment: threads and limits are live, usage is not.
+    read_only = FakeT3(grants="orchestration:read")
+    viewer = make_connection()
+    viewer.pair(read_only.port, PAIRING_CODE, False)
+    check("read-only code connects", wait_for(viewer, lambda c: c.view()["live"]["threads"]))
+    check("read-only code has no live usage", not viewer.view()["live"]["usage"])
+    refused_usage = usage_reply(viewer, 30)
+    check("usage without the scope says so", refused_usage is not None and refused_usage["report"] is None
+          and "View diagnostics" in refused_usage["error"] and not read_only.usage_requests)
+    viewer.stop()
+    read_only.server.shutdown()
+
+    # Saved before usage was live: the keyring entry has no scopes and reads as the read scope only.
+    tool_dir = tempfile.mkdtemp()
+    entry = {"port": fake.port, "token": TOKEN, "expiresAt": time.time() + 600,
+             "privateKey": base64.b64encode(saved["privateKey"]).decode()}
+    with open(os.path.join(tool_dir, "entry.json"), "w") as handle:
+        json.dump(entry, handle)
+    tool = os.path.join(tool_dir, "secret-tool")
+    with open(tool, "w") as handle:
+        handle.write(f"#!/bin/sh\ncat {os.path.join(tool_dir, 'entry.json')}\n")
+    os.chmod(tool, 0o700)
+    keyring = t3live.KeyringStore()
+    keyring.tool = tool
+    check("legacy saved token reads as view only", keyring.load()["scopes"] == ["orchestration:read"])
 
     # Wrong code, plain bearer token, extra scope.
     wrong = make_connection()
