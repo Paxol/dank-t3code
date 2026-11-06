@@ -1,0 +1,18 @@
+{
+    "id": "t3codeBar",
+    "name": "T3 Code Bar",
+    "description": "Your T3 Code inbox in the bar: running threads, requests that need you, hover previews, and the Usage page's cost, tokens and limits. A Linux port of eliophan/t3code-bar.",
+    "version": "1.0.0",
+    "author": "Paxol",
+    "type": "composite",
+    "capabilities": ["daemon", "dankbar-widget"],
+    "icon": "forum",
+    "components": {
+        "daemon": "./T3CodeBarDaemon.qml",
+        "widget": "./T3CodeBarWidget.qml"
+    },
+    "settings": "./T3CodeBarSettings.qml",
+    "requires_dms": ">=1.5.0",
+    "requires": ["python3", "xdg-open", "notify-send"],
+    "permissions": ["settings_read", "settings_write"]
+}
