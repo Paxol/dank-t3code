@@ -34,6 +34,17 @@ PluginComponent {
         varName: "inbox"
         defaultValue: null
     }
+    // The Limits tab rendered by the live connection, and the commands sent to it.
+    PluginGlobalVar {
+        id: limitsLiveVar
+        varName: "limitsLive"
+        defaultValue: null
+    }
+    PluginGlobalVar {
+        id: liveCommandVar
+        varName: "liveCommand"
+        defaultValue: null
+    }
     PluginGlobalVar {
         id: retryVar
         varName: "retry"
@@ -41,6 +52,13 @@ PluginComponent {
     }
 
     readonly property var inbox: inboxVar.value
+    readonly property var limitsLive: limitsLiveVar.value
+
+    function sendLiveCommand(command) {
+        liveCommandVar.set(Object.assign({
+            "seq": Date.now()
+        }, command));
+    }
     readonly property bool loading: !inbox
     readonly property var threads: inbox ? (inbox.threads || []) : []
     readonly property bool live: inbox ? !!inbox.live : false

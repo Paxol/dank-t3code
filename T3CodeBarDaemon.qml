@@ -8,12 +8,19 @@ import qs.Modules.Plugins
 // Runs `backend/t3bar.py watch` once for every bar and screen, publishes each
 // inbox snapshot as the "inbox" global var, and raises desktop notifications
 // when a thread starts needing attention.
+//
+// It also runs `backend/t3live.py`, the live Limits connection to the local T3
+// server, and publishes its rendered Limits tab as the "limitsLive" global var.
+// The widget sends it pairing commands through the "liveCommand" global var.
 PluginComponent {
     id: root
 
     readonly property string scriptPath: decodeURIComponent(Qt.resolvedUrl("backend/t3bar.py").toString().replace("file://", ""))
     readonly property string stateDir: (pluginData.stateDir || "").trim()
     readonly property real pollSeconds: Math.max(0.5, Number(pluginData.pollSeconds) || 1)
+    readonly property string liveScriptPath: decodeURIComponent(Qt.resolvedUrl("backend/t3live.py").toString().replace("file://", ""))
+    readonly property bool clock24: pluginData.clock24 !== undefined ? pluginData.clock24 : true
+    property int liveRestarts: 0
     readonly property bool notificationsEnabled: pluginData.notifications !== undefined ? pluginData.notifications : true
 
     // Statuses that raise a notification when a thread enters them (AttentionTracker).
@@ -128,7 +135,10 @@ PluginComponent {
     }
 
     // Settings that change the command restart the reader.
-    onStateDirChanged: restartWatcher()
+    onStateDirChanged: {
+        restartWatcher();
+        liveProcess.running = false;
+    }
     onPollSecondsChanged: restartWatcher()
 
     function restartWatcher() {
@@ -146,8 +156,85 @@ PluginComponent {
     Connections {
         target: root.pluginService
         function onGlobalVarChanged(changedPluginId, varName) {
-            if (changedPluginId === root.pluginId && varName === "retry")
+            if (changedPluginId !== root.pluginId)
+                return;
+            if (varName === "retry")
                 root.restartWatcher();
+            else if (varName === "liveCommand")
+                root.forwardLiveCommand();
         }
+    }
+
+    // ----- live Limits connection -----
+
+    function liveCommandLine() {
+        const cmd = ["python3", "-I", root.liveScriptPath];
+        if (root.stateDir)
+            cmd.push("--state-dir", root.stateDir);
+        cmd.push("--clock", root.clock24 ? "24" : "12");
+        return cmd;
+    }
+
+    // Hands a command to the live process and clears it at once, so a pairing
+    // code does not stay in the shell's shared state.
+    function forwardLiveCommand() {
+        const command = pluginService ? pluginService.getGlobalVar(pluginId, "liveCommand", null) : null;
+        if (!command || !command.cmd)
+            return;
+        pluginService.setGlobalVar(pluginId, "liveCommand", null);
+        if (!liveProcess.running)
+            return;
+        const message = Object.assign({}, command);
+        delete message.seq;
+        liveProcess.write(JSON.stringify(message) + "\n");
+    }
+
+    onClock24Changed: {
+        if (liveProcess.running)
+            liveProcess.write(JSON.stringify({
+                "cmd": "clock",
+                "twentyFour": root.clock24
+            }) + "\n");
+    }
+
+    Process {
+        id: liveProcess
+        command: root.liveCommandLine()
+        running: true
+        stdinEnabled: true
+
+        stdout: SplitParser {
+            splitMarker: "\n"
+            onRead: line => {
+                let view;
+                try {
+                    view = JSON.parse(line);
+                } catch (e) {
+                    console.warn("t3codeBar: bad limits view", e);
+                    return;
+                }
+                root.liveRestarts = 0;
+                if (root.pluginService)
+                    root.pluginService.setGlobalVar(root.pluginId, "limitsLive", view);
+            }
+        }
+
+        stderr: SplitParser {
+            onRead: line => console.warn("t3codeBar live:", line)
+        }
+
+        // An unremembered token lives only in this process, so a restart needs a new pairing,
+        // as when the macOS app quits.
+        onExited: (exitCode, exitStatus) => {
+            liveRestartTimer.interval = Math.min(30000, 2000 * Math.pow(2, root.liveRestarts));
+            root.liveRestarts += 1;
+            liveRestartTimer.restart();
+        }
+    }
+
+    Timer {
+        id: liveRestartTimer
+        repeat: false
+        onTriggered: liveProcess.running = true
     }
 }

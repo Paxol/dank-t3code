@@ -13,12 +13,13 @@ This is a Linux port of [eliophan/t3code-bar](https://github.com/eliophan/t3code
 - **Notifications.** A desktop notification when a thread needs approval or input, gets a guest request, fails, or hits a usage limit.
 - **Usage.** Click **Usage** under the list for the Cost, Tokens and Limits tabs of T3 Code's Usage page:
   - **Cost** and **Tokens** cover the past 24 hours, 7, 30 or 90 days, with cost or tokens by type, by provider, a daily (or hourly) chart, totals, cost by speed and a per-model breakdown.
-  - **Limits** shows each provider's remaining quota per window, its pace, the even-pace marker, reset times and banked reset credits.
+  - **Limits** shows each provider's remaining quota per window, its pace, the even-pace marker, reset times and banked reset credits. Paired with T3 Code, it streams the same data T3 Code's Usage page uses, including CLI Proxy pooled accounts. See [Live limits](#live-limits).
 
 ## Requirements
 
 - DMS 1.5 or later.
-- `python3` (3.10 or later, standard library only), `xdg-open` and `notify-send`.
+- `python3` (3.10 or later), `xdg-open` and `notify-send`.
+- For live limits: the Python `cryptography` package (`python-cryptography` on Arch), and `secret-tool` (libsecret) to remember the connection.
 - T3 Code, opened at least once. Its `t3code://` URL handler must be registered to open threads from the bar.
 
 ## Installation
@@ -46,6 +47,25 @@ Then add **T3 Code Bar** to a bar section in **Settings → Dank Bar**, or open 
 | T3 Code data directory | empty | Folder with `statev2.sqlite`. Empty uses `$T3_CODE_BAR_STATE_DIR`, then `$T3CODE_HOME/userdata`, then `~/.t3/userdata`. |
 | T3 Code desktop entry | `com.t3tools.T3Code` | The desktop entry that **Open T3 Code** launches. |
 
+## Live limits
+
+Without a connection, the Limits tab shows T3 Code's saved provider checks from `~/.t3/caches`. To get the same live data as T3 Code's Usage page, including CLI Proxy pooled accounts, pair the widget with the local T3 server once:
+
+1. In T3 Code, open **Settings → Connections → Authorized clients** and click **Create link**.
+2. Give it a label such as `T3 Code Bar Limits`. Under **Permissions**, keep only **View environment** (`orchestration:read`). The **Read only** preset includes more scopes.
+3. Create the link and copy its code. Use the new code, not a provider key, an existing client token, or a full pairing URL.
+4. In the widget, open **Usage → Limits → Connect…**, check the **Local port**, paste the code, and click **Pair & connect**.
+5. Turn on **Remember in keyring** to reconnect automatically after a restart. Without it, the token lives only until the shell restarts.
+
+How the connection works, following the macOS app:
+
+- The code is exchanged at `http://127.0.0.1:<port>/oauth/token` for an access token with exactly `orchestration:read`. Only a DPoP-bound token is accepted, never a plain bearer token. The pairing code is never saved or logged.
+- With that token the widget gets a WebSocket ticket, opens `ws://127.0.0.1:<port>/ws`, and subscribes to `subscribeServerConfig` with `usageLimitSources`. It reads provider snapshots and CLI Proxy sources, and ignores settings, keybinding and theme updates. It acknowledges every chunk and pings every 5 seconds.
+- It only ever contacts `127.0.0.1`, with no proxies, cookies or redirects. It never sends refresh, reset-credit or settings commands.
+- **Remember** stores only the widget's own token, its private key, port and expiry in the desktop keyring (`secret-tool`, service `t3codebar.limits`). **Disconnect** deletes it. To revoke the session on the server, use T3 Code's authorized-client controls. An expired token needs a new pairing.
+- While connected, the live provider list is authoritative, so disabled or deleted providers are not revived from saved files. If the connection drops, the widget keeps the last live data, merges it with newer saved checks, says so, and reconnects every 3 seconds.
+- DPoP limits reuse of a stolen token, but it does not authenticate the server: a process impersonating T3 Code on that port could receive the pairing code. Pair only while your local T3 Code is running.
+
 ## How it works
 
 A daemon component runs `backend/t3bar.py watch` once for all bars and screens. The script opens T3 Code's `statev2.sqlite` read-only, derives each thread's status the way the original app does, and prints a JSON line whenever the inbox changes. It re-reads when the database or its WAL changes, and every 5 seconds regardless, because snooze timers and server liveness change without a write. The widget reads the shared snapshot and runs the script on demand for previews, usage and limits.
@@ -56,15 +76,16 @@ A daemon component runs `backend/t3bar.py watch` once for all bars and screens. 
 | Server online, browser link port | `server-runtime.json` (process presence, not an HTTP check) |
 | Thread links | `environment-id` |
 | Cost and tokens | `usage-scan-cache-vN.json`, `usage-model-rates.json`, and the `usagePriceOverrides` and `usageModelAliases` keys of `settings.json` |
-| Limits | `~/.t3/caches/*.json`, T3 Code's provider snapshots |
+| Limits, live | The local T3 server's `subscribeServerConfig` stream, after pairing |
+| Limits, fallback | `~/.t3/caches/*.json`, T3 Code's saved provider snapshots |
 
-The widget never writes to T3 Code's files, reads no credentials, and makes no network calls. Links open T3 Code with `t3code://threads/<environment>/<thread>`, or the browser with `http://127.0.0.1:<port>/<environment>/<thread>`.
+The widget never writes to T3 Code's files and never reads T3 Code's credentials. Its only network traffic is the optional live connection to `127.0.0.1`. A second daemon process, `backend/t3live.py`, holds that connection and renders the Limits tab. Links open T3 Code with `t3code://threads/<environment>/<thread>`, or the browser with `http://127.0.0.1:<port>/<environment>/<thread>`.
 
 The status rules, inbox order, usage counting, pricing and limits layout follow the original app, which documents them in its [compatibility notes](https://github.com/eliophan/t3code-bar/blob/main/docs/COMPATIBILITY.md). They depend on T3 Code's internal schema and cache formats, which can change between versions.
 
 ## Differences from the macOS app
 
-- **Limits read T3 Code's saved provider snapshots only.** The macOS app also pairs with the local T3 server to stream live limits and CLI Proxy pooled accounts. That pairing (OAuth with DPoP, a WebSocket RPC subscription, keyring storage) is not ported, so the widget never asks for a pairing code. The numbers are as fresh as T3 Code's last provider check, and the tab says when they are old.
+- **Pairing is optional.** The macOS app requires the live connection before it shows anything. Here the thread list works without it, and the Limits tab falls back to saved provider checks until you pair.
 - **Cost and Tokens read T3 Code's transcript cache only.** The local OpenCode and Antigravity databases, the Cursor account cache, and the Codex service-tier lookup in `statev2.sqlite` are not ported. Their usage is missing, and unresolved Codex turns count at standard speed.
 - **No self-updater.** Update with `git pull` in the plugin folder, then run `dms ipc call plugins reload t3codeBar`.
 - Status icons are Material Symbols from the shell instead of Lucide icons.
@@ -77,7 +98,10 @@ python3 -I backend/t3bar.py preview <thread>  # start of the last reply
 python3 -I backend/t3bar.py limits            # the Limits tab
 python3 -I backend/t3bar.py usage --period 7  # the Cost and Tokens tabs
 python3 -I tests/test_usage_canary.py         # usage numbers against the original's golden canary
-dms ipc call plugins reload t3codeBar         # reload after a QML change
+python3 -I tests/test_live.py                 # live connection against a fake T3 server
+python3 -I backend/t3live.py                  # live Limits process; reads JSON commands on stdin
+dms ipc call plugins reload t3codeBar         # reload after a change to the root QML files
+dms restart                                   # needed after changing other QML files, which Qt caches
 dms ipc call widget toggle t3codeBar          # open or close the popout
 ```
 

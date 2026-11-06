@@ -863,6 +863,9 @@ def merged_accounts(visible: list[dict], enabled: list[dict]) -> list[dict]:
         newest = dict(limits) if limits["checkedAt"] > current["limits"]["checkedAt"] else dict(current["limits"])
         newest["credits"] = credits.get(key, (0, None))[1]
         current["displayName"] = current["displayName"] or record["trimmedName"]
+        # A CLI Proxy account with an email drops the provider's generic name, so its initials show.
+        if record.get("isSource") and record["email"] and (current["displayName"] or "").lower() == driver_label(record["driver"]).lower():
+            current["displayName"] = None
         current["plan"] = plans.get(key, (0, None))[1] or current["plan"] or record["plan"]
         current["limits"] = newest
 
@@ -1055,12 +1058,16 @@ def fmt_credits(credits: dict, now: float, compact: bool) -> str:
     return f"{credits['count']} {noun} banked" + (f" · next expires in {expires}" if expires else "")
 
 
-def read_limits(base: str, twenty_four: bool) -> dict:
-    directory = os.path.join(os.path.dirname(os.path.normpath(base)), "caches")
-    now = now_ms()
+def cache_directory(base: str) -> str:
+    """T3 writes provider snapshots to `<base>/../caches`, next to the state directory."""
+    return os.path.join(os.path.dirname(os.path.normpath(base)), "caches")
+
+
+def read_cache_records(base: str):
+    """(records, skipped files), or (None, 0) when the caches directory does not exist."""
+    directory = cache_directory(base)
     if not os.path.isdir(directory):
-        return {"state": "noCacheDirectory", "groups": [], "notices": [], "links": [], "skippedFiles": 0,
-                "staleness": None, "footnote": LIMITS_FOOTNOTE}
+        return None, 0
     records, skipped = [], 0
     for name in sorted(os.listdir(directory)):
         path = os.path.join(directory, name)
@@ -1071,11 +1078,27 @@ def read_limits(base: str, twenty_four: bool) -> dict:
             skipped += 1
         else:
             records.append(record)
+    return records, skipped
 
+
+def read_limits(base: str, twenty_four: bool) -> dict:
+    records, skipped = read_cache_records(base)
+    if records is None:
+        return {"state": "noCacheDirectory", "groups": [], "notices": [], "links": [], "skippedFiles": 0,
+                "staleness": None, "footnote": LIMITS_FOOTNOTE}
+    return render_limits(records, skipped, twenty_four)
+
+
+def render_limits(records: list[dict], skipped: int, twenty_four: bool, source_notices=None,
+                  footnote: str | None = None) -> dict:
+    """T3's merge (LimitsMerge.snapshot) and layout (LimitsLayout.groups), rendered for the widget."""
+    now = now_ms()
     visible = [r for r in records if r["enabled"] and r["installed"] and r["available"] and r["limits"] is not None]
     accounts = merged_accounts(visible, [r for r in records if r["enabled"]])
-    notices = []
+    notices = list(source_notices or [])
     for record in visible:
+        if record.get("isSource"):
+            continue
         limits = record["limits"]
         if limits["unavailableReason"] == "unsupported":
             continue
@@ -1169,7 +1192,7 @@ def read_limits(base: str, twenty_four: bool) -> dict:
                      "These numbers may be out of date. Open T3 Code to refresh them.")
     state = "noLimitsReported" if not accounts and not notices and not link_list else "ok"
     return {"state": state, "groups": groups, "notices": notices, "links": link_list, "skippedFiles": skipped,
-            "staleness": staleness, "footnote": LIMITS_FOOTNOTE}
+            "staleness": staleness, "footnote": footnote or LIMITS_FOOTNOTE}
 
 
 LIMITS_FOOTNOTE = "Read from T3 Code's last check of each provider. This widget never contacts a provider."

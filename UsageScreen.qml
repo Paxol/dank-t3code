@@ -10,7 +10,9 @@ Column {
     required property var host
 
     property var report: null
-    property var limits: null
+    property var polledLimits: null
+    // The live connection renders the tab, with T3 Code's saved files as its fallback.
+    readonly property var limits: host.limitsLive || polledLimits
     property bool loadingReport: false
     property bool loadingLimits: false
     property bool showAllModels: false
@@ -34,11 +36,13 @@ Column {
     }
 
     function refreshLimits() {
+        if (host.limitsLive)
+            return;
         loadingLimits = true;
         host.backend("limits", ["limits", "--clock", host.clock24 ? "24" : "12"], data => {
             loadingLimits = false;
             if (data)
-                limits = data;
+                polledLimits = data;
         });
     }
 
@@ -495,6 +499,13 @@ Column {
             }
 
             // ===== Limits =====
+
+            LimitsConnection {
+                visible: usage.tab === "limits"
+                width: parent.width
+                host: usage.host
+                live: usage.limits ? usage.limits.live || null : null
+            }
 
             Message {
                 visible: usage.tab === "limits" && !usage.limits
