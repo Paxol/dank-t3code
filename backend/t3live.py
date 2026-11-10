@@ -10,16 +10,24 @@ RPCs T3 Code's own sidebar and Usage page use.
     - Cost and tokens: `server.getUsageSummary`, the server's priced usage
       buckets (`diagnostics:read`, optional).
 
-    1. The user creates a pairing code in T3 Code with "View environment"
-       (`orchestration:read`) and, for live cost and tokens, "View diagnostics
-       and usage" (`diagnostics:read`), and gives it to the widget.
-    2. The code is exchanged at loopback `/oauth/token` for a DPoP-bound access
-       token with at most those two scopes. The pairing code is never stored.
+    1. The user gives the widget either a pairing code created in T3 Code with
+       "View environment" (`orchestration:read`) and, for live cost and tokens,
+       "View diagnostics and usage" (`diagnostics:read`), or an access token from
+       `t3 auth session issue` with those scopes.
+    2. A pairing code is exchanged at loopback `/oauth/token` for a bearer access
+       token with at most those two scopes. No DPoP proof is sent: T3 Code limits a
+       DPoP-bound token to one hour and offers no refresh, while a bearer token
+       lasts its session's lifetime (30 days by default). The pairing code is never
+       stored. A pasted access token is used as it is.
     3. A WebSocket ticket is issued with that token, the socket opens at
        `ws://127.0.0.1:<port>/ws`, and the widget subscribes to the server config
        and the thread shells.
-    4. Only "Remember" stores the widget's own token and key, in the desktop
-       keyring (secret-tool). Nothing else is persisted.
+    4. Only "Remember" stores the widget's own token, in the desktop keyring
+       (secret-tool). Nothing else is persisted. A token T3 Code rejects as expired
+       or revoked is deleted from the keyring.
+    5. T3 Code's runtime file says where the server listens. The connection pauses
+       while the server is down and reconnects, on the new port if it moved, when
+       it is back.
 
 The process reads JSON commands on stdin and prints one JSON line per change:
 
@@ -32,7 +40,7 @@ saved provider files, as the original app does, and the widget falls back to its
 own readers of `statev2.sqlite` and the usage cache.
 
 Commands:
-  {"cmd": "pair", "port": 3773, "code": "...", "remember": false}
+  {"cmd": "pair", "port": 3773, "code": "...", "remember": false}   a pairing code or an access token
   {"cmd": "reconnectSaved", "port": 3773}
   {"cmd": "disconnect"}
   {"cmd": "clock", "twentyFour": true}
@@ -57,19 +65,9 @@ import sys
 import threading
 import time
 import urllib.parse
-import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import t3bar  # noqa: E402
-
-try:
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.asymmetric import ec
-    from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
-
-    HAVE_CRYPTO = True
-except ImportError:  # pragma: no cover - reported to the user instead
-    HAVE_CRYPTO = False
 
 REQUEST_ID = 0  # subscribeServerConfig
 SHELL_ID = 1  # orchestration.subscribeShell
@@ -85,10 +83,12 @@ READ_SCOPE = "orchestration:read"
 USAGE_SCOPE = "diagnostics:read"
 REQUESTED_SCOPES = [READ_SCOPE, USAGE_SCOPE]
 MAX_MESSAGE = 32 * 1024 * 1024  # a thread shell snapshot lists every active thread
+MAX_TOKEN = 16384
 RETRY_SECONDS = 3
 USAGE_TIMEOUT_SECONDS = 60
 LIVE_FOOTNOTE = ("Live from the local T3 Code server, as T3 Code's Usage page shows it. "
                  "Read-only; this widget never contacts a provider.")
+OFFLINE_TEXT = "T3 Code is not running. Reconnects when it starts."
 STATUS_TEXT = {
     "cacheOnly": "Not connected. Showing T3 Code's saved provider checks.",
     "connecting": "Connecting…",
@@ -103,24 +103,20 @@ class LiveError(Exception):
 
     MESSAGES = {
         "destination": "Enter a local T3 Code port from 1 to 65535.",
-        "authorization": "Pairing failed. Create a new read-only code.",
+        "invalidToken": "Enter a pairing code or an access token of up to 16 KiB.",
+        "pairingRejected": ("T3 Code rejected this pairing code. It may have expired or already been used. "
+                            "Create a new one and try again."),
+        "authorization": "T3 Code refused the connection. Pair again or paste a new access token.",
+        "scope": ("This token must have View environment (orchestration:read), optionally View diagnostics "
+                  "and usage (diagnostics:read), and nothing that can change T3 Code."),
         "protocolMismatch": "This T3 Code version returned an unsupported Limits stream.",
-        "expired": "The access token expired. Pair again in T3 Code.",
+        "expired": "The access token expired or was revoked. Pair again or paste a new access token.",
         "storage": "Could not save the access token in the keyring. Connect again without Remember.",
-        "crypto": "The live connection needs the Python cryptography package (python-cryptography).",
     }
 
     def __init__(self, code: str):
         super().__init__(self.MESSAGES[code])
         self.code = code
-
-
-def b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
-
-
-def compact(value) -> bytes:
-    return json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
 
 
 def valid_port(port) -> int:
@@ -132,49 +128,66 @@ def valid_port(port) -> int:
 def valid_scopes(scopes) -> list[str]:
     """The read scope, optionally with usage. Anything that can change the environment is refused."""
     if not isinstance(scopes, list) or not all(isinstance(scope, str) for scope in scopes):
-        raise LiveError("authorization")
+        raise LiveError("scope")
     if READ_SCOPE not in scopes or len(set(scopes)) != len(scopes) or not set(scopes) <= set(REQUESTED_SCOPES):
-        raise LiveError("authorization")
+        raise LiveError("scope")
     return [scope for scope in REQUESTED_SCOPES if scope in scopes]
 
 
-# ---------------------------------------------------------------------------
-# DPoP (LimitsDPoP.swift): a proof binds the access token to the widget's key.
-# It does not authenticate the server.
-# ---------------------------------------------------------------------------
+def valid_token(token) -> str:
+    if (not isinstance(token, str) or not token or len(token.encode("utf-8")) > MAX_TOKEN
+            or any(ord(c) < 33 or ord(c) == 127 for c in token)):
+        raise LiveError("invalidToken")
+    return token
 
 
-class DPoP:
-    def __init__(self, raw: bytes | None = None):
-        if not HAVE_CRYPTO:
-            raise LiveError("crypto")
-        if raw is None:
-            self.key = ec.generate_private_key(ec.SECP256R1())
-        else:
-            if len(raw) != 32:
-                raise LiveError("authorization")
-            self.key = ec.derive_private_key(int.from_bytes(raw, "big"), ec.SECP256R1())
+def is_access_token(text: str) -> bool:
+    """T3 session tokens are `<base64url claims>.<signature>`. Pairing codes are 12 letters and
+    digits, sometimes with a prefix such as `READ-`, and never contain a dot."""
+    return "." in text
 
-    def raw(self) -> bytes:
-        return self.key.private_numbers().private_value.to_bytes(32, "big")
 
-    def proof(self, method: str, url: str, token: str | None = None) -> str:
-        numbers = self.key.public_key().public_numbers()
-        header = {"typ": "dpop+jwt", "alg": "ES256", "jwk": {
-            "kty": "EC", "crv": "P-256",
-            "x": b64url(numbers.x.to_bytes(32, "big")), "y": b64url(numbers.y.to_bytes(32, "big"))}}
-        target = url.split("#", 1)[0].split("?", 1)[0]
-        payload = {"htm": method, "htu": target, "jti": str(uuid.uuid4()).upper(), "iat": int(time.time())}
-        if token:
-            payload["ath"] = b64url(hashlib.sha256(token.encode("utf-8")).digest())
-        body = b64url(compact(header)) + "." + b64url(compact(payload))
-        r, s = decode_dss_signature(self.key.sign(body.encode("ascii"), ec.ECDSA(hashes.SHA256())))
-        return body + "." + b64url(r.to_bytes(32, "big") + s.to_bytes(32, "big"))
+def token_claims(token: str) -> dict | None:
+    """The claims of a T3 session token, read without checking its signature. The server checks
+    it; the widget only reads the expiry and scopes to explain a failure early."""
+    head = token.split(".", 1)[0]
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(head + "=" * (-len(head) % 4)))
+    except (ValueError, TypeError):
+        return None
+    return claims if isinstance(claims, dict) else None
+
+
+def make_credential(port: int, token: str, scopes: list[str] | None = None,
+                    expires_in: float | None = None) -> dict:
+    """A credential for one token. The token's own `exp` (in milliseconds) wins; a token without a
+    readable expiry is kept until the server rejects it. Scopes come from the exchange reply, or
+    from the token's claims for a pasted token."""
+    token = valid_token(token)
+    claims = token_claims(token) or {}
+    exp = claims.get("exp")
+    if isinstance(exp, (int, float)) and not isinstance(exp, bool) and 0 < exp < float("inf"):
+        expires_at: float | None = exp / 1000
+    elif expires_in is not None:
+        expires_at = time.time() + expires_in
+    else:
+        expires_at = None
+    if scopes is None:
+        claimed = claims.get("scopes")
+        # A token whose scopes cannot be read is tried with both; a missing usage scope is reported
+        # when usage is asked for.
+        scopes = valid_scopes(claimed) if claimed is not None else list(REQUESTED_SCOPES)
+    return {"port": valid_port(port), "token": token, "expiresAt": expires_at, "scopes": valid_scopes(scopes)}
+
+
+def is_expired(credential: dict) -> bool:
+    expires_at = credential.get("expiresAt")
+    return expires_at is not None and expires_at <= time.time()
 
 
 # ---------------------------------------------------------------------------
 # Credential store: the desktop keyring through secret-tool. Only the widget's
-# own exchanged token, its port, expiry, scopes and private key are stored.
+# own token, its port, expiry and scopes are stored.
 # ---------------------------------------------------------------------------
 
 KEYRING_ATTRIBUTES = ["service", "t3codebar.limits", "account", "local-read-only"]
@@ -195,21 +208,26 @@ class KeyringStore:
             return None
         try:
             data = json.loads(result.stdout)
+            expires_at = data.get("expiresAt")
             # Tokens saved before usage was live carry only the read scope.
-            return {
-                "port": valid_port(data["port"]), "token": str(data["token"]),
-                "expiresAt": float(data["expiresAt"]), "privateKey": base64.b64decode(data["privateKey"]),
+            credential = {
+                "port": valid_port(data["port"]), "token": valid_token(data["token"]),
+                "expiresAt": None if expires_at is None else float(expires_at),
                 "scopes": valid_scopes(data.get("scopes", [READ_SCOPE])),
             }
         except (ValueError, KeyError, TypeError, LiveError) as error:
             raise LiveError("storage") from error
+        if "privateKey" in data:
+            # Saved by the DPoP version: the token is bound to that key, lasts an hour and cannot
+            # be sent as a bearer token. It reads as expired, so it is deleted and paired again.
+            credential["expiresAt"] = 0.0
+        return credential
 
     def save(self, credential: dict) -> None:
         if not self.tool:
             raise LiveError("storage")
         secret = json.dumps({
             "port": credential["port"], "token": credential["token"], "expiresAt": credential["expiresAt"],
-            "privateKey": base64.b64encode(credential["privateKey"]).decode("ascii"),
             "scopes": credential.get("scopes", [READ_SCOPE]),
         })
         try:
@@ -235,7 +253,10 @@ class KeyringStore:
 # ---------------------------------------------------------------------------
 
 
-def http_post(port: int, path: str, headers: dict, body: bytes = b"") -> dict:
+def http_post(port: int, path: str, headers: dict, body: bytes = b"",
+              rejected: tuple[str, range] = ("authorization", range(401, 404))) -> dict:
+    """`rejected` names the error for the statuses that mean the credential was refused; other
+    3xx and 4xx answers read as an authorization failure, and 5xx as a transport failure."""
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
     try:
         conn.request("POST", path, body=body, headers=headers)
@@ -245,6 +266,8 @@ def http_post(port: int, path: str, headers: dict, body: bytes = b"") -> dict:
     finally:
         conn.close()
     if status != 200:
+        if status in rejected[1]:
+            raise LiveError(rejected[0])
         if 300 <= status <= 499:
             raise LiveError("authorization")
         raise OSError(f"HTTP {status}")
@@ -557,6 +580,14 @@ class ShellState:
             snapshot = item.get("snapshot")
             if not isinstance(snapshot, dict) or not isinstance(snapshot.get("threads"), list):
                 return False
+            if isinstance(item.get("resolvedRepositoryIdentityRoots"), list):
+                # An enrichment, not a new snapshot: the projects whose repository identity the
+                # server just resolved, with no threads. It updates those projects only.
+                projects = snapshot.get("projects") if isinstance(snapshot.get("projects"), list) else []
+                for project in projects:
+                    if isinstance(project, dict) and isinstance(project.get("id"), str):
+                        self.projects[project["id"]] = project
+                return bool(projects)
             self.threads = {t["id"]: t for t in snapshot["threads"] if isinstance(t, dict) and isinstance(t.get("id"), str)}
             projects = snapshot.get("projects") if isinstance(snapshot.get("projects"), list) else []
             self.projects = {p["id"]: p for p in projects if isinstance(p, dict) and isinstance(p.get("id"), str)}
@@ -746,7 +777,7 @@ class LiveConnection:
     def status_text(self) -> str:
         if self.status == "failed":
             return self.message or "Could not connect to local T3 Code."
-        return STATUS_TEXT.get(self.status, self.status)
+        return self.message or STATUS_TEXT.get(self.status, self.status)
 
     def scopes(self) -> list[str]:
         credential = self.credential
@@ -785,7 +816,6 @@ class LiveConnection:
             "lastUpdatedAgo": t3bar.fmt_ago(last, t3bar.now_ms()) if last else None,
             "port": credential["port"] if credential else None,
             "remembered": self.remembered,
-            "available": HAVE_CRYPTO,
             "keyring": self.store.tool is not None,
             "scopes": scopes,
             "threads": threads_live,
@@ -916,7 +946,8 @@ class LiveConnection:
         self._start(self._pair_worker, port, code if isinstance(code, str) else "", bool(remember))
 
     def reconnect_saved(self, port, quiet: bool = False) -> None:
-        """quiet: the launch-time attempt, where a missing token keeps the onboarding state."""
+        """quiet: an automatic attempt, at launch or when T3 Code starts, where a missing token keeps
+        the onboarding state."""
         if not quiet:
             self.stop()
         with self.lock:
@@ -925,23 +956,65 @@ class LiveConnection:
             self.credential = None
         try:
             valid_port(port)
-            if not HAVE_CRYPTO:
-                raise LiveError("crypto")
             saved = self.store.load()
             if saved is None:
                 if not quiet:
-                    self.set_status(None, "failed", "No saved token. Enter a new read-only pairing code.")
+                    self.set_status(None, "failed", "No saved token. Enter a pairing code or an access token.")
                 return
-            if saved["port"] != port:
-                raise LiveError("destination")
-            if saved["expiresAt"] <= time.time():
+            if is_expired(saved):
+                self._forget_saved(True)
                 raise LiveError("expired")
+            if saved["port"] != port:
+                # T3 Code moved. The port comes from its runtime file or the user, and the token
+                # only ever goes to 127.0.0.1, so it follows.
+                saved = dict(saved, port=port)
+                self.store.save(saved)
         except LiveError as error:
             self.set_status(None, "failed", str(error))
             return
         with self.lock:
             self.credential, self.remembered = saved, True
         self._start(self._connection_worker, saved)
+
+    def follow_server(self, online: bool, port: int | None) -> None:
+        """Called when T3 Code's runtime file changes. Pauses while the server is down, and
+        reconnects, on its new port if it moved, when it is back. Failures that need the user
+        stay as they are."""
+        with self.lock:
+            credential, status = self.credential, self.status
+        if not online or port is None:
+            if status in ("connecting", "live", "retrying"):
+                self.stop()
+                self.set_status(None, "paused", OFFLINE_TEXT)
+            return
+        if status == "failed":
+            return
+        if credential is None:
+            if status == "cacheOnly":
+                self.reconnect_saved(port, quiet=True)
+            return
+        if status == "paused" or credential["port"] != port:
+            self.stop()
+            with self.lock:
+                credential = self.credential = dict(credential, port=port)
+                remembered = self.remembered
+            if remembered:
+                try:
+                    self.store.save(credential)
+                except LiveError:
+                    pass  # the old port stays saved; the next reconnect moves it again
+            self._start(self._connection_worker, credential)
+
+    def _forget_saved(self, remembered: bool) -> None:
+        """Deletes a token T3 Code no longer accepts, so the next launch does not try it again."""
+        if not remembered:
+            return
+        try:
+            self.store.delete()
+        except LiveError:
+            pass
+        with self.lock:
+            self.remembered = False
 
     def disconnect(self) -> None:
         self.stop()
@@ -956,12 +1029,16 @@ class LiveConnection:
     # ----- workers -----
 
     def _pair_worker(self, run: int, port, code: str, remember: bool) -> None:
+        """`code` is a pairing code, exchanged for a token, or an access token used as it is."""
         try:
             port = valid_port(port)
-            code = code.strip()
-            if not code or len(code.encode("utf-8")) >= 16384:
-                raise LiveError("authorization")
-            grant = self._exchange(code, port)
+            code = valid_token(code.strip())
+            if is_access_token(code):
+                grant = make_credential(port, code)
+                if is_expired(grant):
+                    raise LiveError("expired")
+            else:
+                grant = self._exchange(code.upper(), port)
             if not self.current(run):
                 return
             if remember:
@@ -981,7 +1058,6 @@ class LiveConnection:
         self._connection_worker(run, grant)
 
     def _exchange(self, code: str, port: int) -> dict:
-        signer = DPoP()
         path = "/oauth/token"
         form = urllib.parse.urlencode({
             "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
@@ -993,21 +1069,21 @@ class LiveConnection:
             "client_device_type": "desktop",
             "client_os": "linux",
         }, quote_via=urllib.parse.quote)
-        result = http_post(port, path, {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "DPoP": signer.proof("POST", f"http://127.0.0.1:{port}{path}"),
-        }, form.encode("ascii"))
+        # No DPoP proof: with one, T3 Code issues a token that expires after an hour and cannot be
+        # refreshed. Without one it issues a bearer token for its default session lifetime.
+        # 400 is OAuth's invalid_grant: a wrong, used or expired code.
+        result = http_post(port, path, {"Content-Type": "application/x-www-form-urlencoded"},
+                           form.encode("ascii"), rejected=("pairingRejected", range(400, 404)))
         token, seconds = result.get("access_token"), result.get("expires_in")
         scopes = result.get("scope").split() if isinstance(result.get("scope"), str) else None
-        # Only a DPoP-bound token is accepted, never a plain bearer token. The server grants the
-        # requested scopes the code allows: the read scope, and usage when the code includes it.
-        if (result.get("token_type") != "DPoP"
+        # The server grants the requested scopes the code allows: the read scope, and usage when the
+        # code includes it.
+        if (result.get("token_type") != "Bearer"
                 or result.get("issued_token_type") != "urn:ietf:params:oauth:token-type:access_token"
                 or not isinstance(token, str) or not token
                 or isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not 0 < seconds < float("inf")):
-            raise LiveError("authorization")
-        return {"port": port, "token": token, "expiresAt": time.time() + seconds, "privateKey": signer.raw(),
-                "scopes": valid_scopes(scopes)}
+            raise LiveError("protocolMismatch")
+        return make_credential(port, token, valid_scopes(scopes), seconds)
 
     def _sleep(self, run: int, seconds: float) -> bool:
         deadline = time.monotonic() + seconds
@@ -1021,24 +1097,18 @@ class LiveConnection:
         while self.current(run):
             ws = None
             try:
-                if credential["expiresAt"] <= time.time():
+                if is_expired(credential):
                     raise LiveError("expired")
-                signer = DPoP(credential["privateKey"])
                 port, token = valid_port(credential["port"]), credential["token"]
-                path = "/api/auth/websocket-ticket/rpc"
-                issued = http_post(port, path, {
-                    "Authorization": f"DPoP {token}",
-                    "DPoP": signer.proof("POST", f"http://127.0.0.1:{port}{path}", token),
-                })
+                # 401 or 403 here means T3 Code no longer knows the token: expired or revoked.
+                issued = http_post(port, "/api/auth/websocket-ticket/rpc", {"Authorization": f"Bearer {token}"},
+                                   rejected=("expired", range(401, 404)))
                 ticket, expires = issued.get("ticket"), t3bar.parse_date(issued.get("expiresAt"))
                 if not isinstance(ticket, str) or not ticket or expires is None or expires <= t3bar.now_ms():
                     raise LiveError("protocolMismatch")
                 if not self.current(run):
                     return
-                # A WebSocket cannot carry headers, so the upgrade proof rides in the `dpop` parameter
-                # and names the socket URL as the HTTP request the server sees.
-                proof = signer.proof("GET", f"http://127.0.0.1:{port}/ws", ticket)
-                query = urllib.parse.urlencode({"wsTicket": ticket, "orchestrationProtocol": "2", "dpop": proof})
+                query = urllib.parse.urlencode({"wsTicket": ticket, "orchestrationProtocol": "2"})
                 ws = WebSocket(port, "/ws?" + query)
                 with self.lock:
                     if not self.current(run):
@@ -1052,6 +1122,12 @@ class LiveConnection:
                 if self.current(run):
                     with self.lock:
                         self.socket, self.shell = None, None
+                        dead = error.code == "expired"
+                        remembered = self.remembered
+                        if dead:
+                            self.credential = None
+                    if dead:
+                        self._forget_saved(remembered)
                     self.fail_pending_usage("The connection closed.")
                     self.set_status(run, "failed", str(error))
                 return
@@ -1076,7 +1152,7 @@ class LiveConnection:
         while self.current(run):
             now = time.monotonic()
             if now - last_ping >= 5:
-                if time.time() >= credential["expiresAt"]:
+                if is_expired(credential):
                     raise LiveError("expired")
                 if now - last_frame > 15 or (not has_snapshot and now - connected > 15):
                     raise ConnectionError("stream went quiet")
@@ -1104,7 +1180,8 @@ class LiveConnection:
                     if not self.current(run):
                         return
                     if "Authorization" in json.dumps(frame.get("exit")):
-                        raise LiveError("authorization")
+                        # The server ended the stream for the token: revoked while connected.
+                        raise LiveError("expired")
                     raise ConnectionError("stream ended")
                 if tag != "Chunk" or key not in (REQUEST_ID, SHELL_ID) or not isinstance(frame.get("values"), list):
                     raise LiveError("protocolMismatch")
@@ -1172,10 +1249,15 @@ def main() -> int:
     connection = LiveConnection(base, args.clock == "24", events)
     threading.Thread(target=read_commands, args=(events,), daemon=True).start()
 
-    # At launch, reconnect with a remembered token. A missing token keeps the onboarding state.
-    port = t3bar.runtime_port(t3bar.runtime_info(base))
-    if port:
-        connection.reconnect_saved(port, quiet=True)
+    # Where the server is, from its runtime file. At launch and whenever that changes, the connection
+    # follows: a remembered token reconnects, and a missing one keeps the onboarding state.
+    server: tuple[bool, int | None] | None = None
+
+    def server_location() -> tuple[bool, int | None]:
+        runtime = t3bar.runtime_info(base)
+        port = t3bar.runtime_port(runtime)
+        # Without a pid to check, a listed port counts as running.
+        return port is not None and ("pid" not in runtime or t3bar.server_online(runtime)), port
 
     events.put(("render", None))
     last: dict[str, str | None] = {"limits": None, "inbox": None}
@@ -1214,6 +1296,10 @@ def main() -> int:
             elif cmd == "usage":
                 connection.usage(payload.get("period"), payload.get("seq"))
             payload = None  # drop the pairing code as soon as it is handed over
+        location = server_location()
+        if location != server:
+            server = location
+            connection.follow_server(*location)
         connection.fail_pending_usage("T3 Code took too long to read usage.", USAGE_TIMEOUT_SECONDS)
         try:
             emit("limits", {"view": connection.view()}, True)

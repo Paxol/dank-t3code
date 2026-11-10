@@ -20,7 +20,7 @@ This is a Linux port of [eliophan/t3code-bar](https://github.com/eliophan/t3code
 
 - DMS 1.5 or later.
 - `python3` (3.10 or later), `xdg-open` and `notify-send`.
-- For the live connection: the Python `cryptography` package (`python-cryptography` on Arch), and `secret-tool` (libsecret) to remember the connection.
+- For the live connection: `secret-tool` (libsecret) to remember the connection.
 - T3 Code, opened at least once. Its `t3code://` URL handler must be registered to open threads from the bar.
 
 ## Installation
@@ -50,13 +50,24 @@ Then add **T3 Code Bar** to a bar section in **Settings → Dank Bar**, or open 
 
 ## Live connection
 
-Without a connection, the widget reads T3 Code's files: threads from `statev2.sqlite`, cost and tokens from the transcript cache, and limits from the saved provider checks in `~/.t3/caches`. To get the same live data as T3 Code itself, pair the widget with the local T3 server once:
+Without a connection, the widget reads T3 Code's files: threads from `statev2.sqlite`, cost and tokens from the transcript cache, and limits from the saved provider checks in `~/.t3/caches`. To get the same live data as T3 Code itself, connect the widget to the local T3 server once, with a pairing code or an access token.
+
+With a pairing code (the token lasts 30 days):
 
 1. In T3 Code, open **Settings → Connections → Authorized clients** and click **Create link**.
 2. Give it a label such as `T3 Code Bar`. Under **Permissions**, keep only **View environment** (`orchestration:read`) and, for live cost and tokens, **View diagnostics and usage** (`diagnostics:read`). The **Read only** preset includes more scopes.
-3. Create the link and copy its code. Use the new code, not a provider key, an existing client token, or a full pairing URL.
-4. In the widget, open **Usage → Limits → Connect…**, check the **Local port**, paste the code, and click **Pair & connect**.
-5. Turn on **Remember in keyring** to reconnect automatically after a restart. Without it, the token lives only until the shell restarts.
+3. Create the link and copy its code. Use the new code, not a provider key or a full pairing URL.
+
+With an access token from T3 Code's CLI, for a lifetime you choose:
+
+```bash
+t3 auth session issue --scope orchestration:read --scope diagnostics:read --ttl 365d --label "T3 Code Bar" --token-only
+```
+
+Then:
+
+1. In the widget, open **Usage → Limits → Connect…**, check the **Local port**, paste the code or the token, and click **Connect**.
+2. Turn on **Remember in keyring** to reconnect automatically after a restart. Without it, the token lives only until the shell restarts.
 
 What each permission turns live:
 
@@ -66,18 +77,20 @@ What each permission turns live:
 | View environment | Limits, including CLI Proxy pooled accounts | `subscribeServerConfig` with `usageLimitSources` |
 | View diagnostics and usage | Cost and Tokens tabs | `server.getUsageSummary` |
 
-A code with only **View environment** works as before: threads and limits are live, and cost and tokens stay on the transcript cache. A token remembered by an earlier version is treated the same way; pair again with both permissions for live usage.
+A code with only **View environment** works as before: threads and limits are live, and cost and tokens stay on the transcript cache. A token remembered before usage was live is treated the same way; connect again with both permissions for live usage.
 
 How the connection works, following the macOS app:
 
-- The code is exchanged at `http://127.0.0.1:<port>/oauth/token` for an access token. The widget asks for `orchestration:read diagnostics:read`; the server grants the ones the code allows. Only a DPoP-bound token with `orchestration:read` and at most `diagnostics:read` is accepted, never a plain bearer token or one that can change anything. The pairing code is never saved or logged.
-- With that token the widget gets a WebSocket ticket, opens `ws://127.0.0.1:<port>/ws`, and subscribes to `subscribeServerConfig` with `usageLimitSources`. It reads provider snapshots and CLI Proxy sources, and ignores settings, keybinding and theme updates. After the first config it subscribes to `orchestration.subscribeShell`, leaving out idle subagents and older settled threads when the server supports it. It acknowledges every chunk and pings every 5 seconds.
+- A pairing code is exchanged at `http://127.0.0.1:<port>/oauth/token` for a bearer access token. The widget asks for `orchestration:read diagnostics:read`; the server grants the ones the code allows. It sends no DPoP proof, as the current upstream app does: T3 Code gives a DPoP-bound token one hour and no refresh, and a bearer token the session's default 30 days. A token with any scope beyond those two is refused, whether exchanged or pasted. The pairing code is never saved or logged.
+- A pasted access token (anything with a `.`, as T3's session tokens have) is used as it is. Its expiry and scopes are read from its claims.
+- With the token, sent as `Authorization: Bearer`, the widget gets a WebSocket ticket, opens `ws://127.0.0.1:<port>/ws`, and subscribes to `subscribeServerConfig` with `usageLimitSources`. It reads provider snapshots and CLI Proxy sources, and ignores settings, keybinding and theme updates. After the first config it subscribes to `orchestration.subscribeShell`, leaving out idle subagents and older settled threads when the server supports it. It acknowledges every chunk and pings every 5 seconds.
 - The thread shells go through the same status rules and inbox order as the `statev2.sqlite` reader. Previews still read the last reply from `statev2.sqlite`.
 - The Cost and Tokens tabs ask `server.getUsageSummary` for the period, with the same window T3 Code's Usage page sends (the past 24 hours by hour, otherwise by day in the local time zone). The server scans and prices the transcripts itself, so live numbers include every source T3 Code reads. A failed or slow request falls back to the transcript cache and says why.
 - It only ever contacts `127.0.0.1`, with no proxies, cookies or redirects. It never sends refresh, reset-credit, settings or thread commands.
-- **Remember** stores only the widget's own token, its private key, port, scopes and expiry in the desktop keyring (`secret-tool`, service `t3codebar.limits`). **Disconnect** deletes it. To revoke the session on the server, use T3 Code's authorized-client controls. An expired token needs a new pairing.
+- **Remember** stores only the widget's own token, its port, scopes and expiry in the desktop keyring (`secret-tool`, service `t3codebar.limits`). **Disconnect** deletes it. To revoke the session on the server, use T3 Code's authorized-client controls. Neither kind of token can be refreshed: when T3 Code rejects one as expired or revoked, the widget says so and deletes it from the keyring, and you connect again with a new code or token. A token remembered by the DPoP version is deleted the same way.
+- The widget follows `server-runtime.json`. While T3 Code is not running the connection pauses; when it starts again, on the same or a new port, a remembered token reconnects.
 - While connected, the live provider list is authoritative, so disabled or deleted providers are not revived from saved files. If the connection drops, the thread list returns to `statev2.sqlite`, the Limits tab keeps the last live data, merges it with newer saved checks and says so, and the widget reconnects every 3 seconds.
-- DPoP limits reuse of a stolen token, but it does not authenticate the server: a process impersonating T3 Code on that port could receive the pairing code. Pair only while your local T3 Code is running.
+- A bearer token works for whoever holds it. It is limited to reading this machine's T3 Code, and stored only in the keyring. Nothing authenticates the server either: a process impersonating T3 Code on that port could receive the code or token. Connect only while your local T3 Code is running.
 
 ## How it works
 

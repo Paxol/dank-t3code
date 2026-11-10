@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """The live connection against a fake T3 server on loopback.
 
-The fake checks what the real server checks: the DPoP proof signature, method,
-URL and access-token hash on every request, the pairing code and scope on the
-token exchange, and the ticket on the WebSocket upgrade. It then streams a
-config snapshot and a CLI Proxy source update, the thread shells, and answers
-usage summaries when the token has the usage scope. It expects an Ack per chunk.
-No real credentials, keyring or T3 server are used. Run with:
+The fake checks what the real server checks: the pairing code and scope on the
+token exchange, which must carry no DPoP proof so the server issues a bearer
+token, the bearer token on the ticket request, and the ticket on the WebSocket
+upgrade. It then streams a config snapshot and a CLI Proxy source update, the
+thread shells, and answers usage summaries when the token has the usage scope.
+It expects an Ack per chunk. No real credentials, keyring or T3 server are used.
+Run with:
 
     python3 -I tests/test_live.py
 """
@@ -29,37 +30,19 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "backend"))
 import t3live  # noqa: E402
 
-from cryptography.hazmat.primitives import hashes  # noqa: E402
-from cryptography.hazmat.primitives.asymmetric import ec  # noqa: E402
-from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature  # noqa: E402
-
 PAIRING_CODE = "PAIR-CODE-123"
-TOKEN = "access-token-abc"
 TICKET = "ticket-xyz"
+EXPIRES_AT = time.time() + 30 * 86400
 
 
-def unb64(text):
-    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+def session_token(scopes=("orchestration:read", "diagnostics:read"), expires_at=EXPIRES_AT, method="bearer-access-token"):
+    """A token shaped like T3's: base64url claims, a dot, and a signature only the server checks."""
+    claims = {"v": 1, "kind": "session", "sid": "s1", "sub": "cli-issued-session", "scopes": list(scopes),
+              "method": method, "iat": int(time.time() * 1000), "exp": int(expires_at * 1000)}
+    return base64.urlsafe_b64encode(json.dumps(claims).encode()).rstrip(b"=").decode() + ".c2lnbmF0dXJl"
 
 
-def verify_proof(proof, method, url, token=None):
-    head, body, signature = proof.split(".")
-    header, payload = json.loads(unb64(head)), json.loads(unb64(body))
-    assert header["typ"] == "dpop+jwt" and header["alg"] == "ES256", header
-    jwk = header["jwk"]
-    key = ec.EllipticCurvePublicNumbers(int.from_bytes(unb64(jwk["x"]), "big"), int.from_bytes(unb64(jwk["y"]), "big"),
-                                        ec.SECP256R1()).public_key()
-    raw = unb64(signature)
-    der = encode_dss_signature(int.from_bytes(raw[:32], "big"), int.from_bytes(raw[32:], "big"))
-    key.verify(der, f"{head}.{body}".encode(), ec.ECDSA(hashes.SHA256()))
-    assert payload["htm"] == method, payload
-    assert payload["htu"] == url, (payload["htu"], url)
-    assert abs(payload["iat"] - time.time()) < 60
-    if token:
-        assert payload["ath"] == base64.urlsafe_b64encode(hashlib.sha256(token.encode()).digest()).rstrip(b"=").decode()
-    else:
-        assert "ath" not in payload
-    return jwk
+TOKEN = session_token()
 
 
 def provider(driver, used, email):
@@ -143,12 +126,13 @@ def usage_summary(request):
 
 
 class FakeT3:
-    def __init__(self, token_type="DPoP", scope=None, grants="orchestration:read diagnostics:read"):
+    def __init__(self, token_type="Bearer", scope=None, grants="orchestration:read diagnostics:read", tokens=(TOKEN,)):
         self.token_type, self.grants = token_type, grants.split()
         self.scope = scope
+        self.tokens = set(tokens)  # the tokens the server knows; removing one revokes it
         self.acks, self.shell_acks, self.pings, self.requests = 0, 0, 0, []
         self.shell_payload, self.usage_requests = None, []
-        self.key = None
+        self.proofs = []
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -166,25 +150,23 @@ class FakeT3:
             def do_POST(self):
                 length = int(self.headers.get("Content-Length") or 0)
                 body = self.rfile.read(length).decode()
-                base = f"http://127.0.0.1:{fake.port}"
                 fake.requests.append(self.path)
+                fake.proofs.append(self.headers.get("DPoP"))
                 if self.path == "/oauth/token":
-                    jwk = verify_proof(self.headers["DPoP"], "POST", base + "/oauth/token")
                     form = dict(urllib.parse.parse_qsl(body))
                     if form.get("subject_token") != PAIRING_CODE:
-                        return self.reply(401, {"code": "auth_invalid"})
+                        return self.reply(400, {"error": "invalid_grant"})
                     assert form["scope"] == "orchestration:read diagnostics:read", form["scope"]
                     assert form["subject_token_type"] == "urn:t3:params:oauth:token-type:environment-bootstrap"
-                    fake.key = jwk
-                    # The server grants the requested scopes the code allows.
+                    # The server grants the requested scopes the code allows. A DPoP proof would make
+                    # it a one-hour DPoP token; without one it is a bearer token for 30 days.
                     granted = fake.scope or " ".join(s for s in form["scope"].split() if s in fake.grants)
                     return self.reply(200, {"access_token": TOKEN, "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
-                                            "token_type": fake.token_type, "expires_in": 3600, "scope": granted})
+                                            "token_type": fake.token_type, "expires_in": 30 * 86400, "scope": granted})
                 if self.path == "/api/auth/websocket-ticket/rpc":
-                    if self.headers.get("Authorization") != f"DPoP {TOKEN}":
+                    auth = self.headers.get("Authorization") or ""
+                    if not auth.startswith("Bearer ") or auth[7:] not in fake.tokens:
                         return self.reply(401, {"code": "auth_invalid"})
-                    jwk = verify_proof(self.headers["DPoP"], "POST", base + self.path, TOKEN)
-                    assert jwk == fake.key, "proof key differs from the bound key"
                     return self.reply(200, {"ticket": TICKET, "expiresAt": "2099-01-01T00:00:00.000Z"})
                 self.reply(404, {})
 
@@ -193,7 +175,7 @@ class FakeT3:
                 query = dict(urllib.parse.parse_qsl(url.query))
                 if url.path != "/ws" or query.get("wsTicket") != TICKET or query.get("orchestrationProtocol") != "2":
                     return self.reply(401, {})
-                verify_proof(query["dpop"], "GET", f"http://127.0.0.1:{fake.port}/ws", TICKET)
+                assert "dpop" not in query, "a bearer socket carries no proof"
                 key = self.headers["Sec-WebSocket-Key"].encode()
                 accept = base64.b64encode(hashlib.sha1(key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest()).decode()
                 self.send_response(101)
@@ -268,7 +250,12 @@ class FakeT3:
                 frame = json.loads(payload)
                 if frame["_tag"] == "Request" and frame["tag"] == "orchestration.subscribeShell":
                     self.shell_payload, shell_id = frame["payload"], frame["id"]
-                    self.send(sock, {"_tag": "Chunk", "requestId": shell_id, "values": [SHELL_SNAPSHOT]})
+                    # As T3 Code 0.1.8 does: the snapshot, then an enrichment with no threads and the
+                    # projects whose repository identity was resolved.
+                    enrichment = {"kind": "snapshot", "resolvedRepositoryIdentityRoots": ["/nowhere/bar"], "snapshot": dict(
+                        SHELL_SNAPSHOT["snapshot"], threads=[],
+                        projects=[dict(SHELL_SNAPSHOT["snapshot"]["projects"][0], title="Bar (resolved)")])}
+                    self.send(sock, {"_tag": "Chunk", "requestId": shell_id, "values": [SHELL_SNAPSHOT, enrichment]})
                     self.send(sock, {"_tag": "Chunk", "requestId": shell_id, "values": [
                         {"kind": "thread.updated", "sequence": 11, "location": "archive",
                          "thread": shell("t-done", "Done", archivedAt=iso(-1))},
@@ -365,10 +352,12 @@ def main():
     check("pooled accounts named by initials", sorted(a["name"] for a in groups["codex"]["accounts"]) == ["AE", "BE"])
     check("empty source notice", "Spare proxy: No accounts reported." in view["notices"])
     check("live footnote", view["footnote"] == t3live.LIVE_FOOTNOTE)
-    check("remembered token stored with its key",
+    check("pairing sends no DPoP proof", fake.requests[0] == "/oauth/token" and not any(fake.proofs))
+    check("remembered token stored without a key",
           connection.store.saved is not None and connection.store.saved["token"] == TOKEN
-          and len(connection.store.saved["privateKey"]) == 32)
-    check("pairing code never stored", PAIRING_CODE not in json.dumps({**connection.store.saved, "privateKey": ""}))
+          and "privateKey" not in connection.store.saved)
+    check("expiry from the token's own claim", abs(connection.credential["expiresAt"] - EXPIRES_AT) < 1)
+    check("pairing code never stored", PAIRING_CODE not in json.dumps(connection.store.saved))
     check("token carries the usage scope", connection.credential["scopes"] == ["orchestration:read", "diagnostics:read"]
           and connection.store.saved["scopes"] == ["orchestration:read", "diagnostics:read"])
 
@@ -382,6 +371,8 @@ def main():
     inbox = connection.inbox()
     by_id = {t["id"]: t for t in inbox["threads"]}
     check("inbox is live", inbox["live"] and inbox["serverOnline"] and inbox["source"] == "live")
+    check("enrichment snapshot keeps the threads and updates the project",
+          len(inbox["threads"]) == 4 and by_id["t-approval"]["projectTitle"] == "Bar (resolved)")
     check("subagent and settled threads are left out", "t-sub" not in by_id and "t-settled" not in by_id)
     check("approval from the pending request", by_id["t-approval"]["status"] == "approval")
     check("working from the active run", by_id["t-working"]["status"] == "working"
@@ -430,17 +421,76 @@ def main():
     again.disconnect()
     check("disconnect forgets the token", again.status == "cacheOnly" and again.store.saved is None and again.data is None)
 
-    # Saved token for another port.
+    # Saved token for another port: T3 Code moved, and the token follows it.
     other = make_connection()
     other.store.saved = dict(saved, port=fake.port + 1 if fake.port < 65535 else 1)
     other.reconnect_saved(fake.port)
-    check("saved token for another port is refused", other.status == "failed" and "port" in other.message)
+    check("saved token follows the server's port", wait_for(other, lambda c: c.status == "live")
+          and other.store.saved["port"] == fake.port)
+    other.stop()
 
-    # Expired saved token.
+    # Expired saved token: refused and forgotten.
     expired = make_connection()
     expired.store.saved = dict(saved, expiresAt=time.time() - 1)
     expired.reconnect_saved(fake.port)
     check("expired token asks to pair again", expired.status == "failed" and "expired" in expired.message)
+    check("expired token is deleted", expired.store.saved is None)
+
+    # A saved token without an expiry is kept until the server refuses it.
+    lasting = make_connection()
+    lasting.store.saved = dict(saved, expiresAt=None)
+    lasting.reconnect_saved(fake.port)
+    check("token without expiry connects", wait_for(lasting, lambda c: c.status == "live"))
+    lasting.stop()
+
+    # An access token from `t3 auth session issue`, pasted instead of a code.
+    exchanges = fake.requests.count("/oauth/token")
+    pasted = make_connection()
+    pasted.pair(fake.port, " " + TOKEN + "\n", True)
+    check("pasted access token connects", wait_for(pasted, lambda c: c.view()["live"]["threads"]))
+    check("pasted token is not exchanged", fake.requests.count("/oauth/token") == exchanges)
+    check("pasted token's scopes come from its claims", pasted.view()["live"]["usage"]
+          and pasted.store.saved["token"] == TOKEN)
+    pasted.stop()
+    for token, name in [(session_token(scopes=("orchestration:read", "orchestration:operate")), "token that can change T3 refused"),
+                        (session_token(expires_at=time.time() - 60), "expired pasted token refused")]:
+        refused = make_connection()
+        refused.pair(fake.port, token, False)
+        check(name, wait_for(refused, lambda c: c.status == "failed") and refused.store.saved is None
+              and fake.requests.count("/oauth/token") == exchanges)
+
+    # Revoked on the server: the ticket request is refused, and the saved token is deleted.
+    revoked_token = session_token(scopes=("orchestration:read",))
+    fake.tokens.add(revoked_token)
+    revoked = make_connection()
+    revoked.pair(fake.port, revoked_token, True)
+    check("token goes live before revocation", wait_for(revoked, lambda c: c.status == "live")
+          and revoked.store.saved is not None)
+    fake.tokens.discard(revoked_token)
+    revoked.stop()
+    revoked.reconnect_saved(fake.port)
+    check("revoked token says so", wait_for(revoked, lambda c: c.status == "failed") and "revoked" in revoked.message)
+    check("revoked token is forgotten", revoked.store.saved is None and revoked.credential is None)
+
+    # Following T3 Code's runtime file: pause while it is down, reconnect when it is back or moved.
+    follower = make_connection()
+    follower.store.saved = dict(saved)
+    follower.follow_server(True, fake.port)
+    check("server start reconnects the saved token", wait_for(follower, lambda c: c.status == "live"))
+    follower.follow_server(False, fake.port)
+    check("server stop pauses", follower.status == "paused" and follower.status_text() == t3live.OFFLINE_TEXT
+          and follower.view()["live"]["retained"])
+    follower.follow_server(True, fake.port)
+    check("server back resumes", wait_for(follower, lambda c: c.status == "live"))
+    moved = FakeT3()
+    follower.follow_server(True, moved.port)
+    check("server on a new port is followed", wait_for(follower, lambda c: c.status == "live" and moved.acks >= 1)
+          and follower.credential["port"] == moved.port and follower.store.saved["port"] == moved.port)
+    follower.stop()
+    moved.server.shutdown()
+    idle = make_connection()
+    idle.follow_server(True, fake.port)
+    check("server start without a saved token stays onboarding", idle.status == "cacheOnly")
 
     # A code with only View environment: threads and limits are live, usage is not.
     read_only = FakeT3(grants="orchestration:read")
@@ -454,26 +504,33 @@ def main():
     viewer.stop()
     read_only.server.shutdown()
 
-    # Saved before usage was live: the keyring entry has no scopes and reads as the read scope only.
+    # Keyring entries from earlier versions.
     tool_dir = tempfile.mkdtemp()
-    entry = {"port": fake.port, "token": TOKEN, "expiresAt": time.time() + 600,
-             "privateKey": base64.b64encode(saved["privateKey"]).decode()}
-    with open(os.path.join(tool_dir, "entry.json"), "w") as handle:
-        json.dump(entry, handle)
     tool = os.path.join(tool_dir, "secret-tool")
     with open(tool, "w") as handle:
         handle.write(f"#!/bin/sh\ncat {os.path.join(tool_dir, 'entry.json')}\n")
     os.chmod(tool, 0o700)
     keyring = t3live.KeyringStore()
     keyring.tool = tool
-    check("legacy saved token reads as view only", keyring.load()["scopes"] == ["orchestration:read"])
 
-    # Wrong code, plain bearer token, extra scope.
+    def stored(entry):
+        with open(os.path.join(tool_dir, "entry.json"), "w") as handle:
+            json.dump(entry, handle)
+        return keyring.load()
+
+    # Saved before usage was live: no scopes, so it reads as the read scope only.
+    check("saved token without scopes reads as view only",
+          stored({"port": fake.port, "token": TOKEN, "expiresAt": time.time() + 600})["scopes"] == ["orchestration:read"])
+    # Saved by the DPoP version: bound to a key this version no longer has, so it reads as expired.
+    check("DPoP-era saved token reads as expired", t3live.is_expired(stored(
+        {"port": fake.port, "token": TOKEN, "expiresAt": time.time() + 600, "privateKey": base64.b64encode(b"k" * 32).decode()})))
+
+    # Wrong code, DPoP-bound token, extra scope.
     wrong = make_connection()
     wrong.pair(fake.port, "nope", False)
-    check("wrong code fails", wait_for(wrong, lambda c: c.status == "failed") and "Pairing failed" in wrong.message)
-    for token_type, scope, name in [("Bearer", "orchestration:read", "plain bearer token refused"),
-                                    ("DPoP", "orchestration:read orchestration:operate", "extra scope refused")]:
+    check("wrong code fails", wait_for(wrong, lambda c: c.status == "failed") and "rejected this pairing code" in wrong.message)
+    for token_type, scope, name in [("DPoP", "orchestration:read", "DPoP-bound token refused"),
+                                    ("Bearer", "orchestration:read orchestration:operate", "extra scope refused")]:
         strict = FakeT3(token_type, scope)
         refused = make_connection()
         refused.pair(strict.port, PAIRING_CODE, False)

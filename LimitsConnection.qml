@@ -3,8 +3,9 @@ import qs.Common
 import qs.DCommon.Widgets
 
 // The live connection to the local T3 server (LimitsConnectionView in the macOS app):
-// its status, and a form to pair with a new read-only code. The connection also
-// feeds the thread list and, with the usage scope, the Cost and Tokens tabs.
+// its status, and a form to connect with a new read-only pairing code or an access
+// token from T3's CLI. The connection also feeds the thread list and, with the
+// usage scope, the Cost and Tokens tabs.
 Column {
     id: panel
 
@@ -116,15 +117,6 @@ Column {
         }
     }
 
-    StyledText {
-        visible: !!panel.live && !panel.live.available
-        width: parent.width
-        wrapMode: Text.WordWrap
-        text: "Install the Python cryptography package (python-cryptography) to connect live."
-        font.pixelSize: Theme.fontSizeSmall
-        color: Theme.warning
-    }
-
     // Pairing form
     Column {
         visible: panel.expanded && !panel.connected
@@ -134,8 +126,17 @@ Column {
         StyledText {
             width: parent.width
             wrapMode: Text.WordWrap
-            text: "In T3 Code: Settings → Connections → Authorized clients → Create link. Under Permissions keep only View environment, plus View diagnostics and usage for live cost and tokens, then copy the code."
+            text: "Paste a pairing code or an access token. For a code, in T3 Code: Settings → Connections → Authorized clients → Create link. Under Permissions keep only View environment, plus View diagnostics and usage for live cost and tokens, then copy the code. A code gives a token for 30 days."
             font.pixelSize: Theme.fontSizeSmall
+            color: Theme.surfaceVariantText
+        }
+
+        StyledText {
+            width: parent.width
+            wrapMode: Text.WrapAnywhere
+            text: "For a token that lasts longer, run: t3 auth session issue --scope orchestration:read --scope diagnostics:read --ttl 365d --label \"T3 Code Bar\" --token-only"
+            font.pixelSize: Theme.fontSizeSmall - 1
+            font.family: "monospace"
             color: Theme.surfaceVariantText
         }
 
@@ -157,8 +158,8 @@ Column {
             DTextField {
                 id: codeField
                 width: parent.width - portField.width - Theme.spacingS
-                labelText: "Pairing code"
-                placeholderText: "New read-only code"
+                labelText: "Pairing code or access token"
+                placeholderText: "Code or token"
                 echoMode: TextInput.Password
                 showPasswordToggle: true
                 onAccepted: {
@@ -181,7 +182,7 @@ Column {
             spacing: Theme.spacingS
 
             ActionButton {
-                text: "Pair & connect"
+                text: "Connect"
                 primary: true
                 enabled: codeField.text.trim().length > 0
                 onClicked: panel.pair()
