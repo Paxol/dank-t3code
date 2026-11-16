@@ -7,7 +7,7 @@ import "T3Fmt.js" as Fmt
 //   [badge] [pin] project ............ status or idle time
 //   title ............................ provider logos      (no branch)
 //   title / branch ................... provider logos      (with branch)
-// Resting the pointer for half a second expands the start of the last reply.
+// Resting the pointer for half a second asks the popout to float the start of the last reply.
 Rectangle {
     id: row
 
@@ -17,30 +17,23 @@ Rectangle {
 
     signal activated
     signal menuRequested(Item item, real x, real y)
+    signal previewRequested(Item item)
+    signal previewDismissed
 
     readonly property string status: liveStatus ? thread.status : "settled"
     readonly property bool hasBranch: (thread.branch || "").length > 0
     readonly property bool hovered: rowArea.containsMouse
-    property bool previewOpen: false
-    readonly property var previewData: previewOpen && host.showPreviews ? host.preview(thread) : null
 
     implicitHeight: body.implicitHeight + 14
     radius: Theme.cornerRadius
     color: hovered ? Theme.withAlpha(Theme.surfaceText, 0.07) : "transparent"
 
-    Behavior on implicitHeight {
-        NumberAnimation {
-            duration: 150
-            easing.type: Easing.OutCubic
-        }
-    }
-
     Timer {
         id: hoverTimer
         interval: 500
         onTriggered: {
-            row.previewOpen = true;
             row.host.loadPreview(row.thread);
+            row.previewRequested(row);
         }
     }
 
@@ -49,7 +42,7 @@ Rectangle {
             hoverTimer.restart();
         } else {
             hoverTimer.stop();
-            previewOpen = false;
+            previewDismissed();
         }
     }
 
@@ -208,51 +201,6 @@ Rectangle {
                 providers: row.thread.providers
                 anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
-            }
-        }
-
-        // Hover preview
-        Rectangle {
-            visible: !!row.previewData && row.previewData.text.length > 0
-            width: parent.width
-            height: visible ? previewColumn.implicitHeight + 12 : 0
-            radius: Theme.cornerRadius - 2
-            color: Theme.withAlpha(Theme.surfaceText, 0.05)
-
-            Rectangle {
-                width: 2
-                height: parent.height - 12
-                radius: 1
-                color: Theme.withAlpha(Theme.surfaceText, 0.2)
-                x: 6
-                y: 6
-            }
-
-            Column {
-                id: previewColumn
-                x: 14
-                y: 6
-                width: parent.width - 22
-                spacing: 3
-
-                StyledText {
-                    width: parent.width
-                    text: row.previewData ? row.previewData.text : ""
-                    font.pixelSize: Theme.fontSizeSmall
-                    color: Theme.surfaceVariantText
-                    wrapMode: Text.Wrap
-                    maximumLineCount: 6
-                    elide: Text.ElideRight
-                    textFormat: Text.PlainText
-                }
-
-                StyledText {
-                    visible: !!row.previewData && !!row.previewData.updatedAt
-                    text: row.previewData && row.previewData.updatedAt ? Fmt.ago(row.previewData.updatedAt, row.host.now) : ""
-                    font.pixelSize: Theme.fontSizeSmall - 2
-                    color: Theme.surfaceVariantText
-                    opacity: 0.7
-                }
             }
         }
     }

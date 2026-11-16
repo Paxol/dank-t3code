@@ -579,6 +579,27 @@ PluginComponent {
                 environmentMenuOpen = true;
             }
 
+            // Hover preview of a thread row, floated over the rows around it.
+            property var previewThread: null
+            property rect previewRowRect: Qt.rect(0, 0, 0, 0)
+            readonly property var previewData: previewThread && root.showPreviews ? root.preview(previewThread) : null
+            readonly property bool previewShown: !!previewData && previewData.text.length > 0 && menuThread === null && !environmentMenuOpen
+            // The last preview shown, kept so the card can fade out with its text.
+            property var shownPreview: null
+            onPreviewDataChanged: if (previewData)
+                shownPreview = previewData
+
+            function showPreview(thread, item) {
+                const at = item.mapToItem(popout, 0, 0);
+                previewRowRect = Qt.rect(at.x, at.y, item.width, item.height);
+                previewThread = thread;
+            }
+
+            function hidePreview(thread) {
+                if (previewThread && (previewThread.key || previewThread.id) === (thread.key || thread.id))
+                    previewThread = null;
+            }
+
             Column {
                 id: content
                 width: parent.width
@@ -782,6 +803,7 @@ PluginComponent {
                         boundsBehavior: Flickable.StopAtBounds
                         interactive: contentHeight > height
                         model: root.threads
+                        onContentYChanged: popout.previewThread = null
 
                         delegate: ThreadRow {
                             required property var modelData
@@ -791,6 +813,8 @@ PluginComponent {
                             liveStatus: modelData.sourceLive !== undefined ? modelData.sourceLive : root.live
                             onActivated: root.openThread(modelData)
                             onMenuRequested: (item, x, y) => popout.openMenu(modelData, item, x, y)
+                            onPreviewRequested: item => popout.showPreview(modelData, item)
+                            onPreviewDismissed: popout.hidePreview(modelData)
                         }
                     }
 
@@ -984,6 +1008,69 @@ PluginComponent {
                             Accessible.name: modelData.label
                             Accessible.role: Accessible.MenuItem
                         }
+                    }
+                }
+            }
+
+            // Hover preview card: below the row, or above it when there is no room.
+            Rectangle {
+                id: previewCard
+                readonly property real gap: 4
+                readonly property real below: popout.previewRowRect.y + popout.previewRowRect.height + gap
+                readonly property real above: popout.previewRowRect.y - gap - height
+
+                x: popout.previewRowRect.x + Theme.spacingS
+                y: below + height <= popout.height || above < 0 ? Math.max(0, Math.min(below, popout.height - height)) : above
+                z: 1
+                width: popout.previewRowRect.width - Theme.spacingS * 2
+                height: previewColumn.implicitHeight + Theme.spacingS * 2
+                radius: Theme.cornerRadius
+                color: Theme.surfaceContainerHighest
+                border.width: 1
+                border.color: Theme.withAlpha(Theme.outline, 0.3)
+                opacity: popout.previewShown ? 1 : 0
+                visible: opacity > 0
+
+                Behavior on opacity {
+                    NumberAnimation {
+                        duration: 120
+                        easing.type: Easing.OutCubic
+                    }
+                }
+
+                Rectangle {
+                    x: Theme.spacingS
+                    y: Theme.spacingS
+                    width: 2
+                    height: parent.height - Theme.spacingS * 2
+                    radius: 1
+                    color: Theme.withAlpha(Theme.surfaceText, 0.2)
+                }
+
+                Column {
+                    id: previewColumn
+                    x: Theme.spacingS + 10
+                    y: Theme.spacingS
+                    width: parent.width - Theme.spacingS * 2 - 10
+                    spacing: 3
+
+                    StyledText {
+                        width: parent.width
+                        text: popout.shownPreview ? popout.shownPreview.text : ""
+                        font.pixelSize: Theme.fontSizeSmall
+                        color: Theme.surfaceText
+                        wrapMode: Text.Wrap
+                        maximumLineCount: 10
+                        elide: Text.ElideRight
+                        textFormat: Text.PlainText
+                    }
+
+                    StyledText {
+                        visible: !!popout.shownPreview && !!popout.shownPreview.updatedAt
+                        text: popout.shownPreview && popout.shownPreview.updatedAt ? Fmt.ago(popout.shownPreview.updatedAt, root.now) : ""
+                        font.pixelSize: Theme.fontSizeSmall - 2
+                        color: Theme.surfaceVariantText
+                        opacity: 0.7
                     }
                 }
             }

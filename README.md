@@ -8,7 +8,7 @@ This is a Linux port of [eliophan/t3code-bar](https://github.com/eliophan/t3code
 
 - **Bar mark.** The T3 mark with a dot in the color of the most urgent thread. When a thread needs you, a label such as `Approval 2` or `Failed` sits next to it. Otherwise the bar shows how many threads are running when there are several. Right-click the mark to open T3 Code.
 - **Inbox.** Threads in T3 Code's sidebar order, with pinned threads first. Each row shows the project badge, title, branch, PR number, provider logos and a status: Working, Goal, Approval, Input, Request, Waiting, Failed, Limited (with its reset time), Woke, Done, or the time since the last message.
-- **Previews.** Rest the pointer on a thread for half a second to read the start of its last assistant reply.
+- **Previews.** Rest the pointer on a thread for half a second to read the start of its last assistant reply in a card over the list.
 - **Actions.** Click a thread to open it in T3 Code. Right-click it for **Open in T3 Code**, **Open in Browser** and **Copy Link**. The header has **New thread** and **Open T3 Code**.
 - **Notifications.** A desktop notification when a thread needs approval or input, gets a guest request, fails, or hits a usage limit.
 - **Usage.** Click **Usage** under the list for the Cost, Tokens and Limits tabs of T3 Code's Usage page:
