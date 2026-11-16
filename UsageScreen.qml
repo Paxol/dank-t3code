@@ -31,7 +31,7 @@ Column {
     function refreshReport() {
         loadingReport = true;
         const period = host.usagePeriod;
-        if (host.liveUsage) {
+        if (host.usageFromServer) {
             pendingUsageSeq = host.requestLiveUsage(period);
             liveUsageTimeout.restart();
             return;
@@ -60,8 +60,20 @@ Column {
                 return;
             usage.pendingUsageSeq = 0;
             usage.liveUsageNote = "T3 Code did not answer in time.";
-            usage.readCachedReport(usage.host.usagePeriod);
+            usage.fallBack(usage.host.usagePeriod, usage.host.selection === "all" || usage.host.selection === usage.host.localEnvironmentId, usage.liveUsageNote);
         }
+    }
+
+    // The usage cache is this computer's, so it stands in only for a selection that includes it.
+    function fallBack(period, mayReadCache, reason) {
+        if (mayReadCache) {
+            readCachedReport(period);
+            return;
+        }
+        acceptReport(period, {
+            "state": "unavailable",
+            "message": "Usage unavailable: " + (reason || "not connected.")
+        });
     }
 
     function refreshLimits() {
@@ -103,8 +115,12 @@ Column {
                 usage.acceptReport(reply.period, reply.report);
             } else {
                 usage.liveUsageNote = reply.error || "";
-                usage.readCachedReport(reply.period);
+                usage.fallBack(reply.period, reply.fallback !== false, reply.error);
             }
+        }
+        function onSelectionChanged() {
+            usage.report = null;
+            usage.refresh();
         }
     }
 
@@ -537,6 +553,10 @@ Column {
                             lines.push(report.rejectedFiles + (report.live ? " transcript files were skipped" : " cache entries could not be read") + "; totals may read low.");
                         if (report.malformed > 0)
                             lines.push(report.malformed + " transcript lines could not be read.");
+                        if (report.environments && report.environments.length > 1)
+                            lines.push("Combined from " + report.environments.join(", ") + "; each usage folder counts once.");
+                        for (const note of report.environmentNotes || [])
+                            lines.push(note);
                         if (report.live) {
                             lines.push("Live from T3 Code, read " + report.cacheAge + "." + (report.refreshing ? " T3 Code is rescanning transcripts; newer numbers follow on the next refresh." : ""));
                         } else {

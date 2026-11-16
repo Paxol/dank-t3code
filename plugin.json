@@ -1,7 +1,7 @@
 {
     "id": "t3codeBar",
     "name": "T3 Code Bar",
-    "description": "Your T3 Code inbox in the bar: running threads, requests that need you, hover previews, and the Usage page's cost, tokens and limits. A Linux port of eliophan/t3code-bar.",
+    "description": "Your T3 Code inbox in the bar: running threads, requests that need you, hover previews, and the Usage page's cost, tokens and limits, from this machine and paired remote environments. A Linux port of eliophan/t3code-bar.",
     "version": "1.2.0",
     "author": "Paxol",
     "type": "composite",

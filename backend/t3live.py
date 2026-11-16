@@ -59,6 +59,7 @@ import os
 import queue
 import shutil
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -68,6 +69,7 @@ import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import t3bar  # noqa: E402
+import t3remote  # noqa: E402
 
 REQUEST_ID = 0  # subscribeServerConfig
 SHELL_ID = 1  # orchestration.subscribeShell
@@ -114,8 +116,8 @@ class LiveError(Exception):
         "storage": "Could not save the access token in the keyring. Connect again without Remember.",
     }
 
-    def __init__(self, code: str):
-        super().__init__(self.MESSAGES[code])
+    def __init__(self, code: str, message: str | None = None):
+        super().__init__(message or self.MESSAGES[code])
         self.code = code
 
 
@@ -248,16 +250,21 @@ class KeyringStore:
 
 
 # ---------------------------------------------------------------------------
-# Loopback transport. Only 127.0.0.1 is ever contacted, with no proxies,
-# cookies or redirects.
+# Transport. The local server is only ever reached at 127.0.0.1; a remote one at
+# the origin its pairing link named, checked by t3remote. No proxies, cookies or
+# redirects.
 # ---------------------------------------------------------------------------
 
 
-def http_post(port: int, path: str, headers: dict, body: bytes = b"",
+def local_origin(port: int) -> str:
+    return f"http://127.0.0.1:{valid_port(port)}/"
+
+
+def http_post(origin: str, path: str, headers: dict, body: bytes = b"",
               rejected: tuple[str, range] = ("authorization", range(401, 404))) -> dict:
     """`rejected` names the error for the statuses that mean the credential was refused; other
     3xx and 4xx answers read as an authorization failure, and 5xx as a transport failure."""
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
+    conn = t3remote.http_connection(origin, timeout=15)
     try:
         conn.request("POST", path, body=body, headers=headers)
         response = conn.getresponse()
@@ -283,25 +290,29 @@ def http_post(port: int, path: str, headers: dict, body: bytes = b"",
 
 
 class WebSocket:
-    """A minimal RFC 6455 client for one loopback text stream."""
+    """A minimal RFC 6455 client for one text stream, over TLS for an https origin."""
 
     GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-    def __init__(self, port: int, target: str):
-        self.sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+    def __init__(self, origin: str, target: str):
+        host, netloc, port, secure = t3remote.origin_parts(origin)
+        host = host.strip("[]")
+        self.sock = socket.create_connection((host, port), timeout=10)
         self.send_lock = threading.Lock()
         self.buffer = bytearray()
         self.fragments: bytearray | None = None
         try:
-            self._handshake(port, target)
+            if secure:
+                self.sock = ssl.create_default_context().wrap_socket(self.sock, server_hostname=host)
+            self._handshake(netloc, target)
         except BaseException:
             self.close()
             raise
 
-    def _handshake(self, port: int, target: str) -> None:
+    def _handshake(self, netloc: str, target: str) -> None:
         key = base64.b64encode(os.urandom(16))
         request = (
-            f"GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\n"
+            f"GET {target} HTTP/1.1\r\nHost: {netloc}\r\nUpgrade: websocket\r\n"
             f"Connection: Upgrade\r\nSec-WebSocket-Key: {key.decode()}\r\nSec-WebSocket-Version: 13\r\n\r\n"
         )
         self.sock.sendall(request.encode("ascii"))
@@ -618,12 +629,16 @@ class ShellState:
             return False
         return False  # "synchronized" and kinds a newer server adds
 
-    def items(self, now: float) -> list[dict]:
+    def items(self, now: float, local_files: bool = True) -> list[dict]:
+        """`local_files` False for a remote environment: its project paths name files on the
+        remote machine, so its projects never get an icon from this computer's files."""
         items = []
         for thread in self.threads.values():
             row = shell_row(thread, self.projects)
             if row is None:
                 continue
+            if not local_files:
+                row["favicon_path"] = row["workspace_root"] = None
             try:
                 item = t3bar.thread_item(row, now)
             except (t3bar.ReadError, TypeError, ValueError):
@@ -648,13 +663,14 @@ def shell_pr_number(thread: dict):
 
 def shell_row(thread, projects: dict) -> dict | None:
     """The columns `t3bar.thread_query` reads from statev2.sqlite, from one thread shell. None
-    for rows the inbox leaves out: deleted, archived, settled, subagent and side-chat threads.
+    for rows the inbox leaves out: deleted, archived, settled, delegated, subagent and side-chat threads.
 
     The shell summarizes what the query counts: its one pending request stands for the pending
     count, and a failed latest run stands for the provider session's error state."""
     if not isinstance(thread, dict) or not isinstance(thread.get("id"), str) or thread["id"].startswith("thread:"):
         return None
-    if thread.get("deletedAt") or thread.get("archivedAt") or thread.get("settledAt"):
+    if (thread.get("deletedAt") or thread.get("archivedAt") or thread.get("settledAt")
+            or thread.get("settledOverride") == "settled" or thread.get("delegatedFrom") is not None):
         return None
     lineage = thread.get("lineage") if isinstance(thread.get("lineage"), dict) else {}
     if lineage.get("sideChat") is True or lineage.get("relationshipToParent") == "subagent":
@@ -733,6 +749,61 @@ def local_time_zone() -> str:
     return text or "UTC"
 
 
+UNSUPPORTED_USAGE = "This T3 Code version returned an unsupported usage summary."
+
+
+def usage_exit(exit_value) -> tuple[dict | None, str | None]:
+    """The summary from a `server.getUsageSummary` reply, or why there is none."""
+    if isinstance(exit_value, dict) and exit_value.get("_tag") == "Success":
+        summary = exit_value.get("value")
+        return (summary, None) if isinstance(summary, dict) else (None, UNSUPPORTED_USAGE)
+    text = json.dumps(exit_value)
+    if "EnvironmentAuthorizationError" in text or "missing required scope" in text:
+        return None, "The pairing code does not include View diagnostics and usage."
+    if "UsageReadError" in text:
+        return None, "T3 Code could not read usage. Retrying."
+    return None, "The usage request failed."
+
+
+def usage_report(summary: dict, window: dict, period: int) -> dict:
+    report = t3bar.report_from_summary(summary, window)
+    read_at = t3bar.parse_date(summary.get("readAt")) or t3bar.now_ms()
+    report.update(state="ok", period=period, live=True, cacheModified=read_at,
+                  cacheAge=t3bar.fmt_ago(read_at, t3bar.now_ms()), version=summary.get("contractVersion"),
+                  refreshing=any(isinstance(s, dict) and s.get("refreshing") is True
+                                 for s in summary.get("sources") or []))
+    return report
+
+
+def exchange_code(origin: str, code: str) -> tuple[str, list[str], float]:
+    """Redeems a pairing code at the server's token endpoint: (token, scopes, lifetime)."""
+    form = urllib.parse.urlencode({
+        "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+        "subject_token": code,
+        "subject_token_type": "urn:t3:params:oauth:token-type:environment-bootstrap",
+        "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
+        "scope": " ".join(REQUESTED_SCOPES),
+        "client_label": "T3 Code Bar",
+        "client_device_type": "desktop",
+        "client_os": "linux",
+    }, quote_via=urllib.parse.quote)
+    # No DPoP proof: with one, T3 Code issues a token that expires after an hour and cannot be
+    # refreshed. Without one it issues a bearer token for its default session lifetime.
+    # 400 is OAuth's invalid_grant: a wrong, used or expired code.
+    result = http_post(origin, "/oauth/token", {"Content-Type": "application/x-www-form-urlencoded"},
+                       form.encode("ascii"), rejected=("pairingRejected", range(400, 404)))
+    token, seconds = result.get("access_token"), result.get("expires_in")
+    scopes = result.get("scope").split() if isinstance(result.get("scope"), str) else None
+    # The server grants the requested scopes the code allows: the read scope, and usage when the
+    # code includes it.
+    if (result.get("token_type") != "Bearer"
+            or result.get("issued_token_type") != "urn:ietf:params:oauth:token-type:access_token"
+            or not isinstance(token, str) or not token
+            or isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not 0 < seconds < float("inf")):
+        raise LiveError("protocolMismatch")
+    return token, valid_scopes(scopes), seconds
+
+
 # ---------------------------------------------------------------------------
 # Connection (LimitsLiveConnection)
 # ---------------------------------------------------------------------------
@@ -757,6 +828,9 @@ class LiveConnection:
         self.shell: ShellState | None = None
         self.next_usage_id = FIRST_USAGE_ID
         self.pending_usage: dict[int, dict] = {}
+        self.last_shell: ShellState | None = None  # the last thread shells, kept through an outage
+        self.session = 0  # counts the sockets opened; a new one starts a new alert baseline
+        self.failures = 0  # consecutive transport failures, for the retry delay
 
     # ----- state -----
 
@@ -788,11 +862,7 @@ class LiveConnection:
 
     def view(self) -> dict:
         with self.lock:
-            status, data, last = self.status, self.data, self.last_updated
-            credential = self.credential
-            scopes = self.scopes()
-            usage_live = self.usage_available()
-            threads_live = status == "live" and self.shell is not None
+            status, data = self.status, self.data
         cache, skipped = t3bar.read_cache_records(self.base)
         live_now = data is not None and status == "live"
         if data is None:
@@ -807,21 +877,44 @@ class LiveConnection:
             records = data.providers + data.sources if live_now else data.providers + (cache or []) + data.sources
             view = t3bar.render_limits(records, skipped, self.twenty_four, data.notices,
                                        LIVE_FOOTNOTE if live_now else None)
-        view["live"] = {
+        view["live"] = self.live_block()
+        return view
+
+    def live_block(self) -> dict:
+        """The connection's state, as the Limits tab's connection panel shows it."""
+        with self.lock:
+            status, data, last, credential = self.status, self.data, self.last_updated, self.credential
+            scopes = self.scopes()
+            usage_live = self.usage_available()
+            threads_live = status == "live" and self.shell is not None
+        live_now = data is not None and status == "live"
+        return {
             "status": status,
             "text": self.status_text(),
             "connected": live_now,
             "retained": data is not None and not live_now,
             "lastUpdatedAt": last,
             "lastUpdatedAgo": t3bar.fmt_ago(last, t3bar.now_ms()) if last else None,
-            "port": credential["port"] if credential else None,
+            "port": credential.get("port") if credential else None,
             "remembered": self.remembered,
             "keyring": self.store.tool is not None,
             "scopes": scopes,
             "threads": threads_live,
             "usage": usage_live,
         }
-        return view
+
+    def limit_records(self) -> tuple[list[dict], int, list[str]]:
+        """(records, unreadable files, notices) as `view` merges them, for a view across
+        environments: live records while connected, the saved files without a connection, and
+        both, newest check winning, during an outage."""
+        with self.lock:
+            status, data = self.status, self.data
+        cache, skipped = t3bar.read_cache_records(self.base)
+        if data is None:
+            return list(cache or []), skipped, []
+        if status == "live":
+            return data.providers + data.sources, skipped, list(data.notices)
+        return data.providers + (cache or []) + data.sources, skipped, list(data.notices)
 
     def inbox(self) -> dict | None:
         """The thread inbox from the shell stream, in `t3bar.snapshot`'s shape. None while
@@ -839,74 +932,72 @@ class LiveConnection:
             "summary": t3bar.summarize(threads, True), "source": "live",
         }
 
+    # ----- requests on the open stream -----
+
+    def call(self, tag: str, payload: dict, done, timeout: float = USAGE_TIMEOUT_SECONDS) -> bool:
+        """Sends one request on the open stream. `done(exit, error)` runs once, with the reply's
+        exit value, or with an error text when the connection drops or the server takes longer
+        than `timeout`. False, without calling `done`, when no stream is open."""
+        with self.lock:
+            ws = self.socket if self.status == "live" else None
+            if ws is None:
+                return False
+            request_id = self.next_usage_id
+            self.next_usage_id += 1
+            self.pending_usage[request_id] = {"done": done, "sent": time.monotonic(), "timeout": timeout}
+        try:
+            ws.send_json({"_tag": "Request", "id": request_id, "tag": tag, "payload": payload, "headers": []})
+        except OSError:
+            self._call_failed(request_id, "The connection dropped.")
+        return True
+
+    def _call_failed(self, request_id: int, reason: str) -> None:
+        with self.lock:
+            pending = self.pending_usage.pop(request_id, None)
+        if pending:
+            pending["done"](None, reason)
+
+    def _exit(self, request_id: int, exit_value) -> None:
+        with self.lock:
+            pending = self.pending_usage.pop(request_id, None)
+        if pending:
+            pending["done"](exit_value, None)
+
+    def fail_pending_usage(self, reason: str, older_than: float | None = None) -> None:
+        """Fails the requests still waiting: all of them, or those older than `older_than` or
+        their own timeout."""
+        now = time.monotonic()
+        with self.lock:
+            ids = [i for i, p in self.pending_usage.items()
+                   if older_than is None or now - p["sent"] > min(older_than, p["timeout"])]
+        for request_id in ids:
+            self._call_failed(request_id, reason)
+
     # ----- usage -----
+
+    def request_usage(self, payload: dict, done) -> bool:
+        return self.usage_available() and self.call("server.getUsageSummary", payload, done)
 
     def usage(self, period, seq) -> None:
         """Asks the server for one period's usage summary. The reply arrives as a "usage" event;
         without live usage it carries an error, and the widget reads the usage cache instead."""
         days = period if period in (1, 7, 30, 90) else 30
-        with self.lock:
-            ws = self.socket if self.usage_available() else None
-            if ws is None:
-                reason = ("The pairing code does not include View diagnostics and usage."
-                          if self.status == "live" else "Not connected.")
-                request_id = None
-            else:
-                request_id = self.next_usage_id
-                self.next_usage_id += 1
-                payload, window = t3bar.usage_request(days, t3bar.now_ms(), local_time_zone())
-                self.pending_usage[request_id] = {"period": days, "seq": seq, "window": window,
-                                                  "sent": time.monotonic()}
-        if request_id is None:
+        payload, window = t3bar.usage_request(days, t3bar.now_ms(), local_time_zone())
+
+        def done(exit_value, error):
+            summary, error = (None, error) if error else usage_exit(exit_value)
+            reply = {"period": days, "seq": seq, "report": None, "error": error}
+            if summary is not None:
+                try:
+                    reply["report"] = usage_report(summary, window, days)
+                except (ValueError, TypeError, AttributeError, KeyError):
+                    reply["error"] = UNSUPPORTED_USAGE
+            self.events.put(("usage", reply))
+
+        if not self.request_usage(payload, done):
+            reason = ("The pairing code does not include View diagnostics and usage."
+                      if self.status == "live" else "Not connected.")
             self.events.put(("usage", {"period": days, "seq": seq, "report": None, "error": reason}))
-            return
-        try:
-            ws.send_json({"_tag": "Request", "id": request_id, "tag": "server.getUsageSummary",
-                          "payload": payload, "headers": []})
-        except OSError:
-            self._usage_failed(request_id, "The connection dropped.")
-
-    def _usage_failed(self, request_id: int, reason: str) -> None:
-        with self.lock:
-            pending = self.pending_usage.pop(request_id, None)
-        if pending:
-            self.events.put(("usage", {"period": pending["period"], "seq": pending["seq"], "report": None,
-                                       "error": reason}))
-
-    def fail_pending_usage(self, reason: str, older_than: float | None = None) -> None:
-        now = time.monotonic()
-        with self.lock:
-            ids = [i for i, p in self.pending_usage.items() if older_than is None or now - p["sent"] > older_than]
-        for request_id in ids:
-            self._usage_failed(request_id, reason)
-
-    def _usage_reply(self, request_id: int, exit_value) -> None:
-        with self.lock:
-            pending = self.pending_usage.pop(request_id, None)
-        if pending is None:
-            return
-        reply = {"period": pending["period"], "seq": pending["seq"], "report": None, "error": None}
-        if isinstance(exit_value, dict) and exit_value.get("_tag") == "Success":
-            summary = exit_value.get("value")
-            try:
-                report = t3bar.report_from_summary(summary, pending["window"])
-                read_at = t3bar.parse_date(summary.get("readAt")) or t3bar.now_ms()
-                report.update(state="ok", period=pending["period"], live=True, cacheModified=read_at,
-                              cacheAge=t3bar.fmt_ago(read_at, t3bar.now_ms()), version=summary.get("contractVersion"),
-                              refreshing=any(isinstance(s, dict) and s.get("refreshing") is True
-                                             for s in summary.get("sources") or []))
-                reply["report"] = report
-            except (ValueError, TypeError, AttributeError, KeyError):
-                reply["error"] = "This T3 Code version returned an unsupported usage summary."
-        else:
-            text = json.dumps(exit_value)
-            if "EnvironmentAuthorizationError" in text or "missing required scope" in text:
-                reply["error"] = "The pairing code does not include View diagnostics and usage."
-            elif "UsageReadError" in text:
-                reply["error"] = "T3 Code could not read usage. Retrying."
-            else:
-                reply["error"] = "The usage request failed."
-        self.events.put(("usage", reply))
 
     # ----- commands -----
 
@@ -942,7 +1033,7 @@ class LiveConnection:
     def pair(self, port, code, remember: bool) -> None:
         self.stop()
         with self.lock:
-            self.credential, self.data, self.last_updated = None, None, None
+            self.credential, self.data, self.last_updated, self.last_shell = None, None, None, None
         self._start(self._pair_worker, port, code if isinstance(code, str) else "", bool(remember))
 
     def reconnect_saved(self, port, quiet: bool = False) -> None:
@@ -1020,6 +1111,7 @@ class LiveConnection:
         self.stop()
         with self.lock:
             self.credential, self.data, self.last_updated, self.remembered = None, None, None, False
+            self.last_shell = None
         try:
             self.store.delete()
             self.set_status(None, "cacheOnly")
@@ -1058,32 +1150,8 @@ class LiveConnection:
         self._connection_worker(run, grant)
 
     def _exchange(self, code: str, port: int) -> dict:
-        path = "/oauth/token"
-        form = urllib.parse.urlencode({
-            "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
-            "subject_token": code,
-            "subject_token_type": "urn:t3:params:oauth:token-type:environment-bootstrap",
-            "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
-            "scope": " ".join(REQUESTED_SCOPES),
-            "client_label": "T3 Code Bar",
-            "client_device_type": "desktop",
-            "client_os": "linux",
-        }, quote_via=urllib.parse.quote)
-        # No DPoP proof: with one, T3 Code issues a token that expires after an hour and cannot be
-        # refreshed. Without one it issues a bearer token for its default session lifetime.
-        # 400 is OAuth's invalid_grant: a wrong, used or expired code.
-        result = http_post(port, path, {"Content-Type": "application/x-www-form-urlencoded"},
-                           form.encode("ascii"), rejected=("pairingRejected", range(400, 404)))
-        token, seconds = result.get("access_token"), result.get("expires_in")
-        scopes = result.get("scope").split() if isinstance(result.get("scope"), str) else None
-        # The server grants the requested scopes the code allows: the read scope, and usage when the
-        # code includes it.
-        if (result.get("token_type") != "Bearer"
-                or result.get("issued_token_type") != "urn:ietf:params:oauth:token-type:access_token"
-                or not isinstance(token, str) or not token
-                or isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not 0 < seconds < float("inf")):
-            raise LiveError("protocolMismatch")
-        return make_credential(port, token, valid_scopes(scopes), seconds)
+        token, scopes, seconds = exchange_code(local_origin(port), code)
+        return make_credential(port, token, scopes, seconds)
 
     def _sleep(self, run: int, seconds: float) -> bool:
         deadline = time.monotonic() + seconds
@@ -1093,28 +1161,42 @@ class LiveConnection:
             time.sleep(0.2)
         return self.current(run)
 
+    def endpoint(self, credential: dict) -> tuple[str, int]:
+        """Where to connect, and the orchestration protocol version to ask for."""
+        return local_origin(credential["port"]), 2
+
+    def retry_seconds(self) -> float:
+        return RETRY_SECONDS
+
+    def retry_message(self, error: Exception) -> str | None:
+        return None
+
     def _connection_worker(self, run: int, credential: dict) -> None:
         while self.current(run):
             ws = None
             try:
                 if is_expired(credential):
                     raise LiveError("expired")
-                port, token = valid_port(credential["port"]), credential["token"]
+                origin, protocol = self.endpoint(credential)
+                token = credential["token"]
                 # 401 or 403 here means T3 Code no longer knows the token: expired or revoked.
-                issued = http_post(port, "/api/auth/websocket-ticket/rpc", {"Authorization": f"Bearer {token}"},
+                issued = http_post(origin, "/api/auth/websocket-ticket/rpc", {"Authorization": f"Bearer {token}"},
                                    rejected=("expired", range(401, 404)))
                 ticket, expires = issued.get("ticket"), t3bar.parse_date(issued.get("expiresAt"))
                 if not isinstance(ticket, str) or not ticket or expires is None or expires <= t3bar.now_ms():
                     raise LiveError("protocolMismatch")
                 if not self.current(run):
                     return
-                query = urllib.parse.urlencode({"wsTicket": ticket, "orchestrationProtocol": "2"})
-                ws = WebSocket(port, "/ws?" + query)
+                query = {"wsTicket": ticket}
+                if protocol == 2:
+                    query["orchestrationProtocol"] = "2"
+                ws = WebSocket(origin, "/ws?" + urllib.parse.urlencode(query))
                 with self.lock:
                     if not self.current(run):
                         ws.close()
                         return
                     self.socket = ws
+                    self.session += 1
                 self._stream(run, ws, credential)
             except LiveError as error:
                 if ws:
@@ -1131,16 +1213,17 @@ class LiveConnection:
                     self.fail_pending_usage("The connection closed.")
                     self.set_status(run, "failed", str(error))
                 return
-            except (OSError, ValueError, http.client.HTTPException):
+            except (OSError, ValueError, http.client.HTTPException) as error:
                 if ws:
                     ws.close()
                 if not self.current(run):
                     return
                 with self.lock:
                     self.socket, self.shell = None, None
+                    self.failures += 1
                 self.fail_pending_usage("The connection dropped.")
-                self.set_status(run, "retrying")
-                if not self._sleep(run, RETRY_SECONDS):
+                self.set_status(run, "retrying", self.retry_message(error))
+                if not self._sleep(run, self.retry_seconds()):
                     return
 
     def _stream(self, run: int, ws: WebSocket, credential: dict) -> None:
@@ -1167,7 +1250,7 @@ class LiveConnection:
                 if tag == "Pong":
                     continue
                 if tag == "Exit" and key is not None and key >= FIRST_USAGE_ID:
-                    self._usage_reply(key, frame.get("exit"))
+                    self._exit(key, frame.get("exit"))
                     continue
                 if tag == "Exit" and key == SHELL_ID:
                     # Threads fall back to statev2.sqlite; the Limits stream stays live.
@@ -1194,7 +1277,7 @@ class LiveConnection:
                         with self.lock:
                             if not self.current(run):
                                 return
-                            self.shell = shell.copy()
+                            self.shell = self.last_shell = shell.copy()
                         self.notify()
                     continue
                 changed = False
@@ -1216,7 +1299,467 @@ class LiveConnection:
                         self.data = state.copy()
                         self.last_updated = t3bar.now_ms()
                         self.status, self.message = "live", None
+                        self.failures = 0
                     self.notify()
+
+
+# ---------------------------------------------------------------------------
+# Remote environments
+# ---------------------------------------------------------------------------
+
+REMOTE_FOOTNOTE = ("Live from this environment's T3 Code server. Read-only; this widget never "
+                   "contacts a provider.")
+REMOTE_TEXT = {
+    "online": "Connected",
+    "connecting": "Connecting…",
+    "offline": "Offline. Reconnecting…",
+    "needsAccess": "Not paired. Paste a new pairing link to connect.",
+    "paused": "Connection paused.",
+}
+REMOTE_RETRY_MAX = 60
+PREVIEW_TIMEOUT_SECONDS = 15
+
+
+def remote_credential(entry: dict, token: str, scopes: list[str], expires_in: float | None) -> dict:
+    credential = make_credential(1, token, scopes, expires_in)
+    del credential["port"]
+    credential.update(origin=entry["origin"], environment=entry["id"])
+    return credential
+
+
+def projection_preview(exit_value) -> dict | None:
+    """The last assistant reply in an `orchestration.getThreadProjection` reply."""
+    if not isinstance(exit_value, dict) or exit_value.get("_tag") != "Success":
+        return None
+    value = exit_value.get("value")
+    messages = value.get("messages") if isinstance(value, dict) else None
+    if not isinstance(messages, list):
+        return None
+    replies = [m for m in messages if isinstance(m, dict) and m.get("role") == "assistant"
+               and isinstance(m.get("text"), str) and m["text"].strip()]
+    if not replies:
+        return {"text": "", "updatedAt": None}
+    last = max(replies, key=lambda m: m.get("createdAt") if isinstance(m.get("createdAt"), str) else "")
+    return {"text": t3bar.excerpt(last["text"][:4000]), "updatedAt": t3bar.parse_date(last.get("updatedAt"))}
+
+
+class RemoteConnection(LiveConnection):
+    """One paired remote environment: the same streams as the local connection, at the origin
+    its pairing link named. Before every connection the server must still name the same
+    environment. The grant lives in the keyring under the environment and its origin."""
+
+    def __init__(self, entry: dict, events: queue.Queue, verify_peer=t3remote.tailscale_peer, store=None):
+        super().__init__("", True, events)
+        self.entry = dict(entry)
+        self.verify_peer = verify_peer
+        self.store = store if store is not None else t3remote.RemoteKeyring(entry["id"], entry["origin"], LiveError)
+        self.status = "needsAccess"
+        self.revoked = False  # T3 Code refused the grant: expired, or revoked there
+
+    @property
+    def environment(self) -> str:
+        return self.entry["id"]
+
+    @property
+    def label(self) -> str:
+        return self.entry["label"]
+
+    def start(self) -> None:
+        """Connects with the grant saved in the keyring, if there is one."""
+        try:
+            saved = self.store.load()
+        except LiveError as error:
+            self.set_status(None, "failed", str(error))
+            return
+        if saved is None:
+            self.set_status(None, "needsAccess")
+            return
+        if is_expired(saved):
+            self.set_status(None, "needsAccess", "Access expired. Paste a new pairing link.")
+            return
+        self.connect(saved, True)
+
+    def connect(self, credential: dict, remembered: bool) -> None:
+        self.stop()
+        with self.lock:
+            self.credential, self.remembered, self.revoked = credential, remembered, False
+        self._start(self._connection_worker, credential)
+
+    def _forget_saved(self, remembered: bool) -> None:
+        self.revoked = True
+        super()._forget_saved(remembered)
+
+    def forget(self, note: str = "Access forgotten. Paste a new pairing link to reconnect.") -> None:
+        """Drops the grant here and in the keyring, and the data it read. T3 Code still lists
+        the client until it is revoked there."""
+        self.stop()
+        with self.lock:
+            self.credential, self.data, self.last_updated, self.last_shell = None, None, None, None
+            self.remembered = False
+        try:
+            self.store.delete()
+        except LiveError:
+            pass
+        self.set_status(None, "needsAccess", note)
+
+    def endpoint(self, credential: dict) -> tuple[str, int]:
+        origin = self.entry["origin"]
+        try:
+            descriptor = t3remote.describe(origin, self.verify_peer)
+        except t3remote.RemoteError as error:
+            if error.code in ("tailscale", "unreachable"):
+                raise OSError(str(error)) from error
+            raise LiveError("remote", str(error)) from error
+        if descriptor["environmentId"] != self.environment:
+            raise LiveError("remote", t3remote.RemoteError.MESSAGES["wrongEnvironment"])
+        return origin, descriptor["protocol"]
+
+    def retry_seconds(self) -> float:
+        return min(REMOTE_RETRY_MAX, RETRY_SECONDS * 2 ** max(0, self.failures - 1))
+
+    def retry_message(self, error: Exception) -> str | None:
+        if isinstance(error, ssl.SSLCertVerificationError):
+            return "Offline: the server's certificate is not trusted. Reconnecting…"
+        return str(error) if isinstance(error, OSError) and "Tailscale" in str(error) else None
+
+    def state(self) -> str:
+        """online, connecting, offline, needsAccess, or failed (with its message)."""
+        with self.lock:
+            status, credential, revoked = self.status, self.credential, self.revoked
+        if status in ("live", "connecting", "retrying"):
+            return {"live": "online", "connecting": "connecting", "retrying": "offline"}[status]
+        if credential is None and (status != "failed" or revoked):
+            return "needsAccess"
+        return status
+
+    def state_text(self, state: str) -> str:
+        with self.lock:
+            message, retained = self.message, self.data is not None or self.last_shell is not None
+            revoked = self.revoked
+        if state == "needsAccess" and revoked:
+            return "Access expired or was revoked in T3 Code. Paste a new pairing link."
+        if state == "offline":
+            text = message or REMOTE_TEXT["offline"]
+            return text + (" Showing the last available data." if retained and not message else "")
+        return message or REMOTE_TEXT.get(state, state)
+
+    def threads(self) -> list[dict] | None:
+        with self.lock:
+            shell = self.shell or self.last_shell
+        if shell is None:
+            return None
+        items = shell.items(t3bar.now_ms(), local_files=False)
+        for item in items:
+            links = t3remote.thread_links(self.entry["origin"], self.environment, item["id"])
+            item.update(environmentId=self.environment, key=f"remote/{self.environment}/{item['id']}", remote=True,
+                        machine=self.entry.get("machine") or "server", appUrl=links["app"],
+                        browserUrl=links["browser"])
+        return items
+
+    def preview(self, thread_id: str, done) -> None:
+        """`done(preview)` with the thread's last reply, or None. Only listed threads are read:
+        from the shell when it carries the reply, otherwise from the thread's projection."""
+        with self.lock:
+            shell = self.shell or self.last_shell
+        thread = shell.threads.get(thread_id) if shell else None
+        if thread is None:
+            done(None)
+            return
+        message = thread.get("latestVisibleMessage")
+        if isinstance(message, dict) and message.get("role") == "assistant" and _text(message.get("text")):
+            done({"text": t3bar.excerpt(message["text"][:4000]), "updatedAt": t3bar.parse_date(message.get("updatedAt"))})
+            return
+        if not self.call("orchestration.getThreadProjection", {"threadId": thread_id},
+                         lambda exit_value, error: done(None if error else projection_preview(exit_value)),
+                         PREVIEW_TIMEOUT_SECONDS):
+            done(None)
+
+    def limit_records(self) -> tuple[list[dict], int, list[str]]:
+        with self.lock:
+            data = self.data
+        if data is None:
+            return [], 0, []
+        return data.providers + data.sources, 0, list(data.notices)
+
+    def live_block(self) -> dict:
+        block = super().live_block()
+        state = self.state()
+        block.update(status=state, text=self.state_text(state), remote=True, label=self.label,
+                     environmentId=self.environment, origin=self.entry["origin"], port=None)
+        return block
+
+    def summary(self) -> dict:
+        state = self.state()
+        threads = self.threads()
+        with self.lock:
+            last, session = self.last_updated, self.session
+        return {
+            "id": self.environment, "label": self.label, "origin": self.entry["origin"],
+            "machine": self.entry.get("machine") or "server", "state": state, "text": self.state_text(state),
+            "connected": state == "online", "usage": self.usage_available(), "scopes": self.scopes(),
+            "remembered": self.remembered, "session": session,
+            "lastUpdatedAgo": t3bar.fmt_ago(last, t3bar.now_ms()) if last else None,
+            "threads": threads or [], "threadsReady": threads is not None,
+        }
+
+
+class Hub:
+    """The local connection and every paired remote environment, and which of them the
+    widget shows: one environment, or all of them."""
+
+    LOCAL_LABEL = "Local"
+
+    def __init__(self, base: str, twenty_four: bool, events: queue.Queue, registry=None,
+                 verify_peer=t3remote.tailscale_peer, keyring=None):
+        self.base, self.events = base, events
+        self.twenty_four = twenty_four
+        self.verify_peer = verify_peer
+        self.keyring = keyring or (lambda entry: t3remote.RemoteKeyring(entry["id"], entry["origin"], LiveError))
+        self.local = LiveConnection(base, twenty_four, events)
+        self.registry = registry if registry is not None else t3remote.Registry()
+        self.lock = threading.Lock()
+        self.pairing = threading.Lock()  # one pairing or list change at a time
+        self.remotes: dict[str, RemoteConnection] = {}
+        self.selection = "all"
+        for entry in self.registry.environments:
+            remote = self._make(entry)
+            threading.Thread(target=remote.start, daemon=True).start()
+
+    def _make(self, entry: dict) -> RemoteConnection:
+        remote = RemoteConnection(entry, self.events, self.verify_peer, self.keyring(entry))
+        remote.twenty_four = self.twenty_four
+        with self.lock:
+            self.remotes[entry["id"]] = remote
+        return remote
+
+    def remote_list(self) -> list[RemoteConnection]:
+        with self.lock:
+            remotes = list(self.remotes.values())
+        return sorted(remotes, key=lambda r: (r.label.casefold(), r.environment))
+
+    def local_id(self) -> str | None:
+        return t3bar.environment_id(self.base)
+
+    def set_clock(self, twenty_four: bool) -> None:
+        self.twenty_four = self.local.twenty_four = twenty_four
+        for remote in self.remote_list():
+            remote.twenty_four = twenty_four
+
+    def select(self, environment) -> None:
+        self.selection = environment if isinstance(environment, str) and environment else "all"
+
+    def stop(self) -> None:
+        self.local.stop()
+        for remote in self.remote_list():
+            remote.stop()
+
+    def fail_slow_calls(self) -> None:
+        for connection in [self.local, *self.remote_list()]:
+            connection.fail_pending_usage("T3 Code took too long to answer.", USAGE_TIMEOUT_SECONDS)
+
+    # ----- pairing -----
+
+    def add(self, link, seq) -> None:
+        threading.Thread(target=self._add_worker, args=(link if isinstance(link, str) else "", seq), daemon=True).start()
+
+    def _add_worker(self, link: str, seq) -> None:
+        reply = {"seq": seq, "ok": False, "error": None, "environmentId": None, "label": None, "local": False}
+        try:
+            origin, code = t3remote.parse_pairing_link(link)
+            descriptor = t3remote.describe(origin, self.verify_peer)
+            environment = descriptor["environmentId"]
+            if environment == self.local_id():
+                # This computer's own server: the local connection pairs with it at 127.0.0.1.
+                host, _, port, _ = t3remote.origin_parts(origin)
+                if not t3remote.is_loopback(host):
+                    port = t3bar.runtime_port(t3bar.runtime_info(self.base)) or port
+                self.local.pair(port, code, self.local.store.tool is not None)
+                reply.update(ok=True, environmentId=environment, label=self.LOCAL_LABEL, local=True)
+            else:
+                with self.pairing:
+                    owner = self.registry.owner_of(origin)
+                    if owner is not None and owner != environment:
+                        raise t3remote.RemoteError("conflict")
+                    if self.registry.error:
+                        raise t3remote.RemoteError("registry", self.registry.error)
+                    token, scopes, seconds = exchange_code(origin, code)
+                    previous = self.registry.find(environment)
+                    entry = self.registry.upsert(descriptor, origin)
+                    credential = remote_credential(entry, token, scopes, seconds)
+                    store = self.keyring(entry)
+                    remembered = store.tool is not None
+                    if remembered:
+                        try:
+                            store.save(credential)
+                        except LiveError:
+                            remembered = False
+                    if previous and previous["origin"] != origin:
+                        try:
+                            self.keyring(previous).delete()
+                        except LiveError:
+                            pass
+                    with self.lock:
+                        old = self.remotes.pop(environment, None)
+                    if old:
+                        old.stop()
+                    self._make(entry).connect(credential, remembered)
+                reply.update(ok=True, environmentId=environment, label=entry["label"], remembered=remembered)
+        except (t3remote.RemoteError, LiveError) as error:
+            reply["error"] = str(error)
+        except (OSError, ValueError, http.client.HTTPException):
+            reply["error"] = t3remote.RemoteError.MESSAGES["unreachable"]
+        self.events.put(("pairing", reply))
+        self.events.put(("render", None))
+
+    def forget(self, environment) -> None:
+        with self.lock:
+            remote = self.remotes.get(environment)
+        if remote:
+            remote.forget()
+
+    def remove(self, environment) -> str | None:
+        with self.pairing:
+            with self.lock:
+                remote = self.remotes.pop(environment, None)
+            if remote:
+                remote.forget()
+            try:
+                self.registry.remove(environment)
+            except t3remote.RemoteError as error:
+                return str(error)
+        return None
+
+    # ----- previews -----
+
+    def preview(self, environment, thread_id, seq) -> None:
+        with self.lock:
+            remote = self.remotes.get(environment)
+
+        def done(result):
+            reply = {"seq": seq, "environment": environment, "thread": thread_id,
+                     "text": (result or {}).get("text", ""), "updatedAt": (result or {}).get("updatedAt"),
+                     "ok": result is not None}
+            self.events.put(("preview", reply))
+
+        if remote is None or not isinstance(thread_id, str):
+            done(None)
+            return
+        remote.preview(thread_id, done)
+
+    # ----- usage -----
+
+    def usage(self, period, seq, environment=None) -> None:
+        """Cost and tokens for the selection. One environment answers alone; All combines every
+        environment with live usage, each usage source counted once."""
+        selection = environment if isinstance(environment, str) and environment else self.selection
+        remotes = self.remote_list()
+        if not remotes or selection == self.local_id():
+            self.local.usage(period, seq)
+            return
+        days = period if period in (1, 7, 30, 90) else 30
+        if selection == "all":
+            targets = [(self.local, self.local_id() or "local", self.LOCAL_LABEL)]
+            targets += [(r, r.environment, r.label) for r in remotes]
+        else:
+            targets = [(r, r.environment, r.label) for r in remotes if r.environment == selection]
+            if not targets:
+                self.events.put(("usage", {"period": days, "seq": seq, "report": None, "fallback": False,
+                                           "error": "This environment is not available."}))
+                return
+        payload, window = t3bar.usage_request(days, t3bar.now_ms(), local_time_zone())
+        lock = threading.Lock()
+        results: dict[str, tuple] = {}
+        notes: list[str] = []
+        participants = []
+        for connection, ident, label in targets:
+            if connection.usage_available():
+                participants.append((connection, ident, label))
+            elif connection is self.local:
+                notes.append("Local is not included: connect it with View diagnostics and usage to add its usage.")
+            else:
+                notes.append(f"{label} is not included: "
+                             + ("its pairing does not include View diagnostics and usage."
+                                if connection.state() == "online" else "not connected."))
+
+        def finish():
+            contributions = [(ident, label, results[ident][0]) for _, ident, label in participants
+                             if results[ident][0] is not None]
+            failures = [f"{label}: {results[ident][1]}" for _, ident, label in participants
+                        if results[ident][0] is None]
+            reply = {"period": days, "seq": seq, "report": None, "error": None, "fallback": selection == "all"}
+            if not contributions:
+                reply["error"] = " ".join(failures + notes) or "Not connected."
+            else:
+                merged, duplicates = (contributions[0][2], []) if len(contributions) == 1 else \
+                    t3remote.merge_summaries(contributions)
+                try:
+                    report = usage_report(merged, window, days)
+                    report.update(environmentNotes=notes + failures + duplicates,
+                                  environments=[label for _, label, _ in contributions])
+                    reply["report"] = report
+                except (ValueError, TypeError, AttributeError, KeyError):
+                    reply["error"] = UNSUPPORTED_USAGE
+            self.events.put(("usage", reply))
+
+        if not participants:
+            self.events.put(("usage", {"period": days, "seq": seq, "report": None, "fallback": selection == "all",
+                                       "error": " ".join(notes) or "Not connected."}))
+            return
+
+        for connection, ident, label in participants:
+            def done(exit_value, error, ident=ident):
+                summary, error = (None, error) if error else usage_exit(exit_value)
+                if summary is not None and not t3remote.summary_matches(summary, payload):
+                    summary, error = None, "returned usage for another period."
+                with lock:
+                    results[ident] = (summary, error)
+                    complete = len(results) == len(participants)
+                if complete:
+                    finish()
+
+            if not connection.request_usage(payload, done):
+                done(None, "Not connected.")
+
+    # ----- views -----
+
+    def view(self) -> dict:
+        """The Limits tab for the selection."""
+        selection, remotes = self.selection, self.remote_list()
+        local_id = self.local_id()
+        if not remotes or selection == local_id:
+            view = self.local.view()
+        elif selection == "all":
+            records, skipped, notices = self.local.limit_records()
+            for remote in remotes:
+                own, _, remote_notices = remote.limit_records()
+                prefix = f"{len(remote.environment)}:{remote.environment}:"
+                records += [dict(record, instanceID=prefix + record["instanceID"]) for record in own]
+                notices += [f"{remote.label}: {notice}" for notice in remote_notices]
+                if remote.state() != "online":
+                    notices.append(f"{remote.label}: {remote.state_text(remote.state())}")
+            names = ", ".join([self.LOCAL_LABEL] + [r.label for r in remotes])
+            view = t3bar.render_limits(records, skipped, self.twenty_four, notices,
+                                       f"All environments: {names}. Read-only; this widget never contacts a provider.")
+            view["live"] = self.local.live_block()
+        else:
+            remote = next((r for r in remotes if r.environment == selection), None)
+            if remote is None:
+                view = t3bar.render_limits([], 0, self.twenty_four, ["This environment is not available."])
+                view["live"] = None
+            else:
+                records, _, notices = remote.limit_records()
+                view = t3bar.render_limits(records, 0, self.twenty_four, notices,
+                                           REMOTE_FOOTNOTE if remote.state() == "online" else None)
+                view["live"] = remote.live_block()
+        view["selection"] = selection
+        return view
+
+    def environments(self) -> dict:
+        return {
+            "localId": self.local_id(), "localLabel": self.LOCAL_LABEL, "selection": self.selection,
+            "registryError": self.registry.error, "keyring": shutil.which("secret-tool") is not None,
+            "list": [remote.summary() for remote in self.remote_list()],
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -1246,7 +1789,8 @@ def main() -> int:
     base = t3bar.state_dir(args.state_dir)
 
     events: queue.Queue = queue.Queue()
-    connection = LiveConnection(base, args.clock == "24", events)
+    hub = Hub(base, args.clock == "24", events)
+    connection = hub.local
     threading.Thread(target=read_commands, args=(events,), daemon=True).start()
 
     # Where the server is, from its runtime file. At launch and whenever that changes, the connection
@@ -1260,7 +1804,7 @@ def main() -> int:
         return port is not None and ("pid" not in runtime or t3bar.server_online(runtime)), port
 
     events.put(("render", None))
-    last: dict[str, str | None] = {"limits": None, "inbox": None}
+    last: dict[str, str | None] = {"limits": None, "inbox": None, "environments": None}
 
     def emit(kind: str, body: dict, dedupe: bool) -> None:
         text = json.dumps(dict(kind=kind, **body), separators=(",", ":"), ensure_ascii=False)
@@ -1278,10 +1822,10 @@ def main() -> int:
             # "Checked 5m ago", saved files and snooze timers change without an event.
             kind, payload = "render", None
         if kind == "eof":
-            connection.stop()
+            hub.stop()
             return 0
-        if kind == "usage":
-            emit("usage", payload, False)
+        if kind in ("usage", "pairing", "preview"):
+            emit(kind, payload, False)
             continue
         if kind == "command":
             cmd = payload.get("cmd")
@@ -1292,18 +1836,31 @@ def main() -> int:
             elif cmd == "disconnect":
                 connection.disconnect()
             elif cmd == "clock":
-                connection.twenty_four = bool(payload.get("twentyFour", True))
+                hub.set_clock(bool(payload.get("twentyFour", True)))
             elif cmd == "usage":
-                connection.usage(payload.get("period"), payload.get("seq"))
-            payload = None  # drop the pairing code as soon as it is handed over
+                hub.usage(payload.get("period"), payload.get("seq"), payload.get("environment"))
+            elif cmd == "select":
+                hub.select(payload.get("environment"))
+            elif cmd == "addEnvironment":
+                hub.add(payload.get("link"), payload.get("seq"))
+            elif cmd == "forgetEnvironment":
+                hub.forget(payload.get("environment"))
+            elif cmd == "removeEnvironment":
+                error = hub.remove(payload.get("environment"))
+                if error:
+                    emit("pairing", {"seq": payload.get("seq"), "ok": False, "error": error}, False)
+            elif cmd == "preview":
+                hub.preview(payload.get("environment"), payload.get("thread"), payload.get("seq"))
+            payload = None  # drop a pairing code or link as soon as it is handed over
         location = server_location()
         if location != server:
             server = location
             connection.follow_server(*location)
-        connection.fail_pending_usage("T3 Code took too long to read usage.", USAGE_TIMEOUT_SECONDS)
+        hub.fail_slow_calls()
         try:
-            emit("limits", {"view": connection.view()}, True)
+            emit("limits", {"view": hub.view()}, True)
             emit("inbox", {"snapshot": connection.inbox()}, True)
+            emit("environments", {"state": hub.environments()}, True)
         except Exception as error:  # noqa: BLE001 - keep the stream alive
             print(f"t3live: render failed: {error}", file=sys.stderr, flush=True)
 

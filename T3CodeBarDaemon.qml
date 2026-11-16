@@ -4,6 +4,7 @@ import Quickshell.Io
 import qs.Common
 import qs.Services
 import qs.Modules.Plugins
+import "T3Fmt.js" as Fmt
 
 // Runs `backend/t3bar.py watch` once for every bar and screen, publishes each
 // inbox snapshot as the "inbox" global var, and raises desktop notifications
@@ -13,6 +14,10 @@ import qs.Modules.Plugins
 // That process renders the Limits tab ("limitsLive"), streams the thread inbox,
 // which replaces the statev2.sqlite reading while it is live, and answers usage
 // requests ("usageLive"). The widget sends it commands through "liveCommand".
+//
+// The same process connects to paired remote environments. Their threads join
+// the inbox for the selected environment, or for all of them, and so do their
+// notifications. With no remote environment the inbox is the local one, as before.
 PluginComponent {
     id: root
 
@@ -35,6 +40,27 @@ PluginComponent {
     property var liveInbox: null
     property string inboxSource: ""
 
+    // Remote environments from the live process, and which environment the widget shows:
+    // "all", or one environment ID. A selected environment that disappears stays selected.
+    property var remoteState: null
+    readonly property string selection: (pluginData.environment || "all")
+    property var envSessions: ({})
+    property bool selectionSent: false
+
+    onSelectionChanged: {
+        root.knownStatuses = null;
+        root.sendSelection();
+        root.publishInbox();
+    }
+
+    function sendSelection() {
+        if (liveProcess.running)
+            liveProcess.write(JSON.stringify({
+                "cmd": "select",
+                "environment": root.selection
+            }) + "\n");
+    }
+
     function command() {
         const cmd = ["python3", "-I", root.scriptPath];
         if (root.stateDir)
@@ -51,7 +77,7 @@ PluginComponent {
     // A switch between the two sources starts a new alert baseline, so the small
     // differences between them do not raise notifications.
     function publishInbox() {
-        const snapshot = root.liveInbox || root.localInbox;
+        const snapshot = root.composeInbox();
         if (!snapshot)
             return;
         const source = root.liveInbox ? "live" : "local";
@@ -79,19 +105,131 @@ PluginComponent {
         return "T3 Code";
     }
 
-    // The first snapshot is a baseline and never alerts.
+    function localState(local) {
+        if (!local)
+            return "connecting";
+        if (local.live)
+            return "online";
+        return local.ok ? "offline" : "unavailable";
+    }
+
+    // The inbox for the selection. Local rows keep their fields; remote rows arrive from the
+    // live process tagged with their environment and links. Each row says whether its source
+    // is live, and only live rows count toward the bar's status.
+    function composeInbox() {
+        const local = root.liveInbox || root.localInbox;
+        const state = root.remoteState;
+        const remotes = state && state.list ? state.list : [];
+        const localId = (local && local.environmentId) || (state ? state.localId : null) || "";
+        const info = {
+            "registryError": state ? state.registryError : null,
+            "keyring": state ? !!state.keyring : false
+        };
+        const localEntry = {
+            "id": localId,
+            "label": "Local",
+            "local": true,
+            "state": root.localState(local),
+            "machine": null
+        };
+        if (!remotes.length) {
+            if (!local)
+                return null;
+            return Object.assign({}, local, {
+                "environments": [localEntry],
+                "environmentInfo": info,
+                "selection": "all",
+                "localLive": !!local.live
+            });
+        }
+        const sel = root.selection;
+        const includeLocal = sel === "all" || sel === localId;
+        // A remote-only setup has no local database; that is not an error worth showing.
+        const localMissing = !local || (!local.ok && local.errorCode === "missing");
+        const threads = [];
+        const counted = [];
+        if (includeLocal && local && local.ok) {
+            for (const thread of local.threads || []) {
+                const row = Object.assign({}, thread, {
+                    "key": "local/" + thread.id,
+                    "environmentId": localId,
+                    "sourceLive": !!local.live
+                });
+                threads.push(row);
+                if (local.live)
+                    counted.push(row);
+            }
+        }
+        const notices = [];
+        let anyLive = includeLocal && !!local && !!local.live;
+        for (const env of remotes) {
+            if (sel !== "all" && sel !== env.id)
+                continue;
+            if (!env.connected)
+                notices.push(env.label + ": " + env.text);
+            anyLive = anyLive || env.connected;
+            for (const thread of env.threads || []) {
+                const row = Object.assign({}, thread, {
+                    "environmentLabel": env.label,
+                    "sourceLive": env.connected
+                });
+                threads.push(row);
+                if (env.connected)
+                    counted.push(row);
+            }
+        }
+        const known = sel === "all" || sel === localId || remotes.some(env => env.id === sel);
+        const base = local || {
+            "port": null,
+            "stateDir": ""
+        };
+        return Object.assign({}, base, {
+            "ok": includeLocal && !localMissing ? !!local.ok : true,
+            "error": includeLocal && !localMissing ? local.error : null,
+            "errorCode": includeLocal && !localMissing ? local.errorCode : null,
+            "serverOnline": includeLocal && !localMissing ? !!local.serverOnline : true,
+            "environmentId": localId,
+            "threads": threads,
+            "live": anyLive,
+            "localLive": includeLocal && !!local && !!local.live,
+            "summary": Fmt.summarize(counted),
+            "environments": [localEntry].concat(remotes.map(env => Object.assign({}, env, {
+                    "threads": undefined
+                }))),
+            "environmentInfo": info,
+            "environmentNotices": known ? notices : ["The selected environment is not available."],
+            "selection": sel
+        });
+    }
+
+    // The first snapshot is a baseline and never alerts, and so is the first one after a
+    // remote environment (re)connects or the selection changes.
     function processAlerts(snapshot) {
         const current = {};
         for (const thread of snapshot.threads || [])
-            current[thread.id] = thread.status;
+            current[thread.key || thread.id] = thread.status;
         const known = root.knownStatuses;
         root.knownStatuses = current;
-        if (known === null || !snapshot.live || !root.notificationsEnabled)
+        const fresh = {};
+        const sessions = {};
+        for (const env of snapshot.environments || []) {
+            if (env.local)
+                continue;
+            sessions[env.id] = env.session;
+            if (root.envSessions[env.id] !== env.session)
+                fresh[env.id] = true;
+        }
+        root.envSessions = sessions;
+        if (known === null || !root.notificationsEnabled)
             return;
         for (const thread of snapshot.threads || []) {
-            if (root.alertingStatuses.indexOf(thread.status) < 0 || known[thread.id] === thread.status)
+            const key = thread.key || thread.id;
+            if (root.alertingStatuses.indexOf(thread.status) < 0 || known[key] === thread.status)
                 continue;
-            Quickshell.execDetached(["notify-send", "--app-name=T3 Code", "--icon=" + decodeURIComponent(Qt.resolvedUrl("assets/T3Logo.png").toString().replace("file://", "")), root.alertTitle(thread.status), thread.title]);
+            if (thread.remote ? (!thread.sourceLive || fresh[thread.environmentId]) : !snapshot.localLive)
+                continue;
+            const body = thread.remote ? thread.title + " · " + thread.environmentLabel : thread.title;
+            Quickshell.execDetached(["notify-send", "--app-name=T3 Code", "--icon=" + decodeURIComponent(Qt.resolvedUrl("assets/T3Logo.png").toString().replace("file://", "")), root.alertTitle(thread.status), body]);
         }
     }
 
@@ -215,6 +353,13 @@ PluginComponent {
                     "report": null,
                     "error": "Not connected."
                 });
+            else if (command.cmd === "addEnvironment" && root.pluginService)
+                root.pluginService.setGlobalVar(root.pluginId, "pairingLive", {
+                    "seq": command.seq,
+                    "ok": false,
+                    "error": "The connection process is restarting. Try again in a moment.",
+                    "receivedAt": Date.now()
+                });
             return;
         }
         liveProcess.write(JSON.stringify(command) + "\n");
@@ -240,6 +385,13 @@ PluginComponent {
             root.publishInbox();
         } else if (message.kind === "usage") {
             root.publishUsage(message);
+        } else if (message.kind === "environments") {
+            root.remoteState = message.state || null;
+            root.publishInbox();
+        } else if (message.kind === "pairing" || message.kind === "preview") {
+            message.receivedAt = Date.now();
+            if (root.pluginService)
+                root.pluginService.setGlobalVar(root.pluginId, message.kind === "pairing" ? "pairingLive" : "previewLive", message);
         }
     }
 
@@ -268,6 +420,10 @@ PluginComponent {
                     return;
                 }
                 root.liveRestarts = 0;
+                if (!root.selectionSent) {
+                    root.selectionSent = true;
+                    root.sendSelection();
+                }
                 root.handleLiveLine(message);
             }
         }
@@ -279,8 +435,10 @@ PluginComponent {
         // An unremembered token lives only in this process, so a restart needs a new pairing,
         // as when the macOS app quits.
         onExited: (exitCode, exitStatus) => {
-            if (root.liveInbox) {
+            root.selectionSent = false;
+            if (root.liveInbox || root.remoteState) {
                 root.liveInbox = null;
+                root.remoteState = null;
                 root.publishInbox();
             }
             liveRestartTimer.interval = Math.min(30000, 2000 * Math.pow(2, root.liveRestarts));

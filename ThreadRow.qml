@@ -101,11 +101,21 @@ Rectangle {
                 }
 
                 StyledText {
-                    width: Math.min(implicitWidth, parent.width - 22 - (row.thread.isPinned ? 18 : 0))
+                    width: Math.min(implicitWidth, parent.width - 22 - (row.thread.isPinned ? 18 : 0) - (row.thread.remote ? 20 : 0))
                     text: row.thread.projectTitle
                     font.pixelSize: Theme.fontSizeSmall
                     color: row.hovered ? Theme.surfaceText : Theme.surfaceVariantText
                     elide: Text.ElideRight
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+
+                // Only rows from another environment show where they run.
+                DIcon {
+                    visible: !!row.thread.remote
+                    name: Fmt.machineIcon(row.thread.machine)
+                    size: 13
+                    color: Theme.surfaceVariantText
+                    opacity: 0.8
                     anchors.verticalCenter: parent.verticalCenter
                 }
             }
@@ -248,5 +258,5 @@ Rectangle {
     }
 
     Accessible.role: Accessible.Button
-    Accessible.name: thread.title + ", in " + thread.projectTitle + (hasBranch ? ", on branch " + thread.branch : "") + (status !== "settled" ? ", " + host.statusLabel(status) : "")
+    Accessible.name: thread.title + ", in " + thread.projectTitle + (thread.remote ? ", on " + (thread.environmentLabel || Fmt.machineName(thread.machine)) : "") + (hasBranch ? ", on branch " + thread.branch : "") + (status !== "settled" ? ", " + host.statusLabel(status) : "")
 }

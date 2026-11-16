@@ -17,7 +17,9 @@ Column {
 
     readonly property string status: live ? live.status : ""
     readonly property bool connected: !!live && live.connected
-    readonly property color tone: connected ? Theme.success : (status === "failed" ? Theme.error : (live && live.retained || status === "retrying" ? Theme.warning : Theme.surfaceVariantText))
+    // A remote environment's connection is managed on the Environments screen.
+    readonly property bool remote: !!live && !!live.remote
+    readonly property color tone: connected ? Theme.success : (status === "failed" ? Theme.error : (live && live.retained || status === "retrying" || status === "offline" ? Theme.warning : Theme.surfaceVariantText))
 
     visible: !!live
     spacing: Theme.spacingS
@@ -33,6 +35,8 @@ Column {
     function headline() {
         if (!live)
             return "";
+        if (remote)
+            return live.label + ": " + (connected ? "live" + (live.lastUpdatedAgo ? " · updated " + live.lastUpdatedAgo : "") : live.text);
         if (connected) {
             const parts = [];
             if (live.threads)
@@ -74,7 +78,7 @@ Column {
 
             DIcon {
                 id: statusIcon
-                name: panel.connected ? "sensors" : (panel.status === "connecting" || panel.status === "retrying" ? "sync" : (panel.status === "failed" ? "error" : "cloud_off"))
+                name: panel.connected ? "sensors" : (panel.status === "connecting" || panel.status === "retrying" || panel.status === "offline" ? "sync" : (panel.status === "failed" ? "error" : "cloud_off"))
                 size: 16
                 color: panel.tone
                 anchors.verticalCenter: parent.verticalCenter
@@ -91,7 +95,7 @@ Column {
 
             StyledText {
                 id: actionText
-                text: panel.connected || (panel.live && panel.live.retained) ? "Disconnect" : (panel.expanded ? "Hide" : "Connect…")
+                text: panel.remote ? "Manage…" : (panel.connected || (panel.live && panel.live.retained) ? "Disconnect" : (panel.expanded ? "Hide" : "Connect…"))
                 font.pixelSize: Theme.fontSizeSmall
                 font.weight: Font.Medium
                 color: Theme.primary
@@ -102,7 +106,9 @@ Column {
                     anchors.margins: -4
                     cursorShape: Qt.PointingHandCursor
                     onClicked: {
-                        if (panel.connected || (panel.live && panel.live.retained)) {
+                        if (panel.remote) {
+                            panel.host.screen = "environments";
+                        } else if (panel.connected || (panel.live && panel.live.retained)) {
                             panel.host.sendLiveCommand({
                                 "cmd": "disconnect"
                             });
@@ -119,7 +125,7 @@ Column {
 
     // Pairing form
     Column {
-        visible: panel.expanded && !panel.connected
+        visible: panel.expanded && !panel.connected && !panel.remote
         width: parent.width
         spacing: Theme.spacingS
 
@@ -200,7 +206,7 @@ Column {
         StyledText {
             width: parent.width
             wrapMode: Text.WordWrap
-            text: "Read-only · This computer only. Connects to 127.0.0.1; linked environments are not included."
+            text: "Read-only · This computer only. Connects to 127.0.0.1. Other machines are added on the Environments screen."
             font.pixelSize: Theme.fontSizeSmall - 2
             color: Theme.surfaceVariantText
             opacity: 0.8

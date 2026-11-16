@@ -56,12 +56,48 @@ PluginComponent {
         varName: "retry"
         defaultValue: 0
     }
+    // Replies from the live process: remote previews, and the result of a pairing link.
+    PluginGlobalVar {
+        id: previewLiveVar
+        varName: "previewLive"
+        defaultValue: null
+        onValueChanged: root.acceptRemotePreview(value)
+    }
+    PluginGlobalVar {
+        id: pairingLiveVar
+        varName: "pairingLive"
+        defaultValue: null
+    }
 
     readonly property var inbox: inboxVar.value
     readonly property var limitsLive: limitsLiveVar.value
     readonly property var usageLive: usageLiveVar.value
     // Cost and tokens come from the server when the pairing includes View diagnostics and usage.
     readonly property bool liveUsage: !!limitsLive && !!limitsLive.live && !!limitsLive.live.usage
+    readonly property var pairingLive: pairingLiveVar.value
+
+    // Environments: Local and every paired remote one. The selection is "all" or one ID.
+    readonly property var environments: inbox && inbox.environments ? inbox.environments : []
+    readonly property bool multiEnvironment: environments.length > 1
+    readonly property string selection: pluginData.environment || "all"
+    readonly property string localEnvironmentId: inbox && inbox.environmentId ? inbox.environmentId : ""
+    // Usage comes from the servers when the selection includes a remote environment.
+    readonly property bool usageFromServer: liveUsage || (multiEnvironment && selection !== localEnvironmentId)
+
+    function environmentById(id) {
+        return environments.find(env => env.id === id) || null;
+    }
+
+    function selectionLabel() {
+        if (selection === "all")
+            return "All environments";
+        const env = environmentById(selection);
+        return env ? env.label : "Unavailable environment";
+    }
+
+    function selectEnvironment(id) {
+        saveSetting("environment", id);
+    }
 
     function sendLiveCommand(command) {
         liveCommandVar.set(Object.assign({
@@ -77,7 +113,8 @@ PluginComponent {
         sendLiveCommand({
             "cmd": "usage",
             "period": period,
-            "seq": seq
+            "seq": seq,
+            "environment": selection
         });
         return seq;
     }
@@ -253,7 +290,16 @@ PluginComponent {
 
     // ----- actions -----
 
-    function threadUrl(threadId, browser) {
+    // Remote rows carry their own links; local ones are built here.
+    function threadUrl(thread, browser) {
+        if (thread.appUrl) {
+            if (browser && !thread.browserUrl) {
+                ToastService.showError("T3 Code", "This environment has no browser address.");
+                return "";
+            }
+            return browser ? thread.browserUrl : thread.appUrl;
+        }
+        const threadId = thread.id;
         const env = inbox ? inbox.environmentId : null;
         if (!env) {
             ToastService.showError("T3 Code", "Environment ID not found. Open T3 Code and check the data directory.");
@@ -278,16 +324,16 @@ PluginComponent {
         closePopout();
     }
 
-    function openThread(threadId) {
-        openUrl(threadUrl(threadId, false));
+    function openThread(thread) {
+        openUrl(threadUrl(thread, false));
     }
 
-    function openThreadInBrowser(threadId) {
-        openUrl(threadUrl(threadId, true));
+    function openThreadInBrowser(thread) {
+        openUrl(threadUrl(thread, true));
     }
 
-    function copyThreadLink(threadId) {
-        const url = threadUrl(threadId, false);
+    function copyThreadLink(thread) {
+        const url = threadUrl(thread, false);
         if (!url)
             return;
         Quickshell.execDetached(["dms", "cl", "copy", url]);
@@ -345,27 +391,64 @@ PluginComponent {
     signal previewLoaded(string threadId)
 
     function preview(thread) {
-        const cached = previewCache[thread.id];
+        const cached = previewCache[thread.key || thread.id];
         if (cached && cached.updatedAt === thread.updatedAt)
             return cached.data;
         return null;
     }
 
+    function storePreview(key, updatedAt, data) {
+        const next = Object.assign({}, previewCache);
+        next[key] = {
+            "updatedAt": updatedAt,
+            "data": data
+        };
+        previewCache = next;
+        previewLoaded(key);
+    }
+
+    // Remote previews in flight, by request seq.
+    property var pendingPreviews: ({})
+
     function loadPreview(thread) {
         if (preview(thread))
             return;
+        const key = thread.key || thread.id;
         const updatedAt = thread.updatedAt;
-        backend("preview." + thread.id, ["preview", thread.id], data => {
-            if (!data)
-                return;
-            const next = Object.assign({}, previewCache);
-            next[thread.id] = {
-                "updatedAt": updatedAt,
-                "data": data
+        if (thread.remote) {
+            const seq = Date.now() * 1000 + Math.floor(Math.random() * 1000);
+            const pending = Object.assign({}, pendingPreviews);
+            pending[seq] = {
+                "key": key,
+                "updatedAt": updatedAt
             };
-            previewCache = next;
-            previewLoaded(thread.id);
+            pendingPreviews = pending;
+            sendLiveCommand({
+                "cmd": "preview",
+                "environment": thread.environmentId,
+                "thread": thread.id,
+                "seq": seq
+            });
+            return;
+        }
+        backend("preview." + thread.id, ["preview", thread.id], data => {
+            if (data)
+                storePreview(key, updatedAt, data);
         });
+    }
+
+    function acceptRemotePreview(reply) {
+        if (!reply || !pendingPreviews[reply.seq])
+            return;
+        const request = pendingPreviews[reply.seq];
+        const pending = Object.assign({}, pendingPreviews);
+        delete pending[reply.seq];
+        pendingPreviews = pending;
+        if (reply.ok)
+            storePreview(request.key, request.updatedAt, {
+                "text": reply.text || "",
+                "updatedAt": reply.updatedAt
+            });
     }
 
     // ----- bar pill -----
@@ -487,6 +570,15 @@ PluginComponent {
                 menuThread = thread;
             }
 
+            // The environment picker's menu.
+            property bool environmentMenuOpen: false
+            property point environmentMenuAt: Qt.point(0, 0)
+
+            function openEnvironmentMenu(item) {
+                environmentMenuAt = item.mapToItem(popout, 0, item.height + 4);
+                environmentMenuOpen = true;
+            }
+
             Column {
                 id: content
                 width: parent.width
@@ -503,7 +595,7 @@ PluginComponent {
                         spacing: Theme.spacingS
 
                         HeaderButton {
-                            visible: root.screen === "usage"
+                            visible: root.screen !== "threads"
                             iconName: "arrow_back"
                             tip: "Back to threads"
                             onClicked: root.screen = "threads"
@@ -523,7 +615,7 @@ PluginComponent {
                             anchors.verticalCenter: parent.verticalCenter
 
                             StyledText {
-                                text: root.screen === "usage" ? "Usage" : "T3 Code"
+                                text: root.screen === "usage" ? "Usage" : (root.screen === "environments" ? "Environments" : "T3 Code")
                                 font.pixelSize: Theme.fontSizeLarge
                                 font.weight: Font.Medium
                                 color: Theme.surfaceText
@@ -535,6 +627,7 @@ PluginComponent {
                                 font.pixelSize: Theme.fontSizeSmall
                                 color: Theme.surfaceVariantText
                             }
+
                         }
                     }
 
@@ -542,6 +635,12 @@ PluginComponent {
                         anchors.right: parent.right
                         anchors.verticalCenter: parent.verticalCenter
                         spacing: Theme.spacingXS
+
+                        HeaderButton {
+                            iconName: "lan"
+                            tip: "Environments"
+                            onClicked: root.screen = "environments"
+                        }
 
                         HeaderButton {
                             iconName: "edit_square"
@@ -555,6 +654,53 @@ PluginComponent {
                             onClicked: root.activateT3Code()
                         }
                     }
+                }
+
+                // The environment picker, once there is more than one environment.
+                Rectangle {
+                    visible: root.multiEnvironment && root.screen !== "environments"
+                    width: chipRow.implicitWidth + Theme.spacingS * 2
+                    height: 22
+                    radius: 11
+                    color: chipArea.containsMouse ? Theme.withAlpha(Theme.surfaceText, 0.12) : Theme.withAlpha(Theme.surfaceText, 0.06)
+
+                    Row {
+                        id: chipRow
+                        anchors.centerIn: parent
+                        spacing: 4
+
+                        DIcon {
+                            name: root.selection === "all" ? "lan" : (root.selection === root.localEnvironmentId ? "computer" : Fmt.machineIcon((root.environmentById(root.selection) || {}).machine))
+                            size: 14
+                            color: Theme.surfaceVariantText
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
+
+                        StyledText {
+                            text: root.selectionLabel()
+                            font.pixelSize: Theme.fontSizeSmall - 1
+                            color: Theme.surfaceText
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
+
+                        DIcon {
+                            name: "expand_more"
+                            size: 14
+                            color: Theme.surfaceVariantText
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
+                    }
+
+                    MouseArea {
+                        id: chipArea
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: popout.openEnvironmentMenu(parent)
+                    }
+
+                    Accessible.name: "Environment: " + root.selectionLabel()
+                    Accessible.role: Accessible.Button
                 }
 
                 // Threads screen
@@ -583,6 +729,17 @@ PluginComponent {
                         width: parent.width
                         iconName: "cloud_off"
                         text: "T3 Code offline · showing saved threads"
+                    }
+
+                    Repeater {
+                        model: root.inbox && root.inbox.environmentNotices ? root.inbox.environmentNotices : []
+
+                        Notice {
+                            required property var modelData
+                            width: parent.width
+                            iconName: "cloud_off"
+                            text: modelData
+                        }
                     }
 
                     // Empty state
@@ -631,8 +788,8 @@ PluginComponent {
                             width: threadList.width
                             host: root
                             thread: modelData
-                            liveStatus: root.live
-                            onActivated: root.openThread(modelData.id)
+                            liveStatus: modelData.sourceLive !== undefined ? modelData.sourceLive : root.live
+                            onActivated: root.openThread(modelData)
                             onMenuRequested: (item, x, y) => popout.openMenu(modelData, item, x, y)
                         }
                     }
@@ -698,6 +855,135 @@ PluginComponent {
                     visible: active
                     sourceComponent: UsageScreen {
                         host: root
+                    }
+                }
+
+                // Environments screen
+                Loader {
+                    width: parent.width
+                    active: root.screen === "environments"
+                    visible: active
+                    sourceComponent: EnvironmentsScreen {
+                        host: root
+                    }
+                }
+            }
+
+            MouseArea {
+                anchors.fill: parent
+                visible: popout.environmentMenuOpen
+                acceptedButtons: Qt.LeftButton | Qt.RightButton
+                onClicked: popout.environmentMenuOpen = false
+            }
+
+            Rectangle {
+                visible: popout.environmentMenuOpen
+                width: 260
+                height: environmentColumn.implicitHeight + Theme.spacingXS * 2
+                x: Math.min(popout.environmentMenuAt.x, popout.width - width)
+                y: popout.environmentMenuAt.y
+                z: 2
+                radius: Theme.cornerRadius
+                color: Theme.surfaceContainerHighest
+                border.width: 1
+                border.color: Theme.withAlpha(Theme.outline, 0.3)
+
+                Column {
+                    id: environmentColumn
+                    x: Theme.spacingXS
+                    y: Theme.spacingXS
+                    width: parent.width - Theme.spacingXS * 2
+
+                    Repeater {
+                        model: [
+                            {
+                                "id": "all",
+                                "label": "All environments",
+                                "icon": "lan",
+                                "state": "online"
+                            }
+                        ].concat(root.environments.map(env => ({
+                                    "id": env.id,
+                                    "label": env.label,
+                                    "icon": env.local ? "computer" : Fmt.machineIcon(env.machine),
+                                    "state": env.state
+                                }))).concat([
+                            {
+                                "id": "",
+                                "label": "Manage environments…",
+                                "icon": "settings",
+                                "state": "online"
+                            }
+                        ])
+
+                        delegate: Rectangle {
+                            required property var modelData
+                            width: environmentColumn.width
+                            height: 32
+                            radius: Theme.cornerRadius - 2
+                            color: environmentItemArea.containsMouse ? Theme.withAlpha(Theme.surfaceText, 0.08) : "transparent"
+
+                            Row {
+                                anchors.left: parent.left
+                                anchors.leftMargin: Theme.spacingS
+                                anchors.right: checkIcon.left
+                                anchors.verticalCenter: parent.verticalCenter
+                                spacing: Theme.spacingS
+
+                                DIcon {
+                                    name: modelData.icon
+                                    size: 16
+                                    color: Theme.surfaceVariantText
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+
+                                StyledText {
+                                    width: Math.min(implicitWidth, 170)
+                                    text: modelData.label
+                                    elide: Text.ElideRight
+                                    font.pixelSize: Theme.fontSizeSmall + 1
+                                    color: Theme.surfaceText
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+
+                                Rectangle {
+                                    visible: modelData.id !== "" && modelData.id !== "all"
+                                    width: 7
+                                    height: 7
+                                    radius: 4
+                                    color: modelData.state === "online" ? Theme.success : (modelData.state === "offline" || modelData.state === "connecting" ? Theme.warning : Theme.surfaceVariantText)
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+                            }
+
+                            DIcon {
+                                id: checkIcon
+                                visible: modelData.id !== "" && modelData.id === root.selection
+                                name: "check"
+                                size: 16
+                                color: Theme.primary
+                                anchors.right: parent.right
+                                anchors.rightMargin: Theme.spacingS
+                                anchors.verticalCenter: parent.verticalCenter
+                            }
+
+                            MouseArea {
+                                id: environmentItemArea
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: {
+                                    popout.environmentMenuOpen = false;
+                                    if (modelData.id === "")
+                                        root.screen = "environments";
+                                    else
+                                        root.selectEnvironment(modelData.id);
+                                }
+                            }
+
+                            Accessible.name: modelData.label
+                            Accessible.role: Accessible.MenuItem
+                        }
                     }
                 }
             }
@@ -781,14 +1067,14 @@ PluginComponent {
                                 hoverEnabled: true
                                 cursorShape: Qt.PointingHandCursor
                                 onClicked: {
-                                    const id = popout.menuThread.id;
+                                    const thread = popout.menuThread;
                                     popout.menuThread = null;
                                     if (modelData.action === "app")
-                                        root.openThread(id);
+                                        root.openThread(thread);
                                     else if (modelData.action === "browser")
-                                        root.openThreadInBrowser(id);
+                                        root.openThreadInBrowser(thread);
                                     else
-                                        root.copyThreadLink(id);
+                                        root.copyThreadLink(thread);
                                 }
                             }
                         }

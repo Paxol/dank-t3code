@@ -19,7 +19,7 @@ PluginSettings {
 
     StyledText {
         width: parent.width
-        text: "Reads T3 Code's local data read-only and never writes to its files. The only network traffic is the optional live connection to 127.0.0.1 for threads, limits and usage, set up from Usage → Limits."
+        text: "Reads T3 Code's local data read-only and never writes to its files. The only network traffic is the optional live connection to 127.0.0.1 for threads, limits and usage, set up from Usage → Limits, and the remote environments you pair from the popout's Environments button."
         font.pixelSize: Theme.fontSizeSmall
         color: Theme.surfaceVariantText
         wrapMode: Text.WordWrap

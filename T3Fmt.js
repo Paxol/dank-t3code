@@ -108,3 +108,84 @@ function columnLabel(ms, hourly) {
     const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     return months[date.getMonth()] + " " + date.getDate();
 }
+
+// ThreadSummary across environments: the strongest status and the badge count the bar shows.
+// The same rules as `summarize` in backend/t3bar.py, which summarizes one environment.
+const STATUS_PRIORITY = {
+    "approval": 8, "input": 7, "request": 7, "goal": 6, "working": 5, "failed": 4, "limited": 4,
+    "woke": 3, "done": 1, "settled": 0, "waiting": 0
+};
+const STATUS_LABELS = {
+    "working": "Working", "goal": "Goal", "approval": "Approval", "input": "Input", "request": "Request",
+    "woke": "Woke", "failed": "Failed", "limited": "Limited", "waiting": "Waiting", "done": "Done",
+    "settled": "Settled"
+};
+const ATTENTION = ["working", "goal", "approval", "input", "request", "failed", "limited", "woke"];
+const RUNNING = ["working", "goal"];
+const LABEL_IN_BAR = ["approval", "input", "request", "woke", "failed", "limited"];
+
+function priority(status) {
+    return STATUS_PRIORITY[status] !== undefined ? STATUS_PRIORITY[status] : 0;
+}
+
+// `threads` are the rows whose source is live; others count as settled.
+function summarize(threads) {
+    let status = "settled", attention = 0, running = 0;
+    for (const thread of threads) {
+        if (priority(thread.status) > priority(status))
+            status = thread.status;
+        if (ATTENTION.indexOf(thread.status) >= 0)
+            attention += 1;
+        if (RUNNING.indexOf(thread.status) >= 0)
+            running += 1;
+    }
+    let badge = 0;
+    if (RUNNING.indexOf(status) >= 0)
+        badge = running;
+    else if (ATTENTION.indexOf(status) >= 0)
+        badge = threads.filter(t => priority(t.status) === priority(status)).length;
+    return {
+        "status": status,
+        "label": STATUS_LABELS[status] || status,
+        "showsLabel": LABEL_IN_BAR.indexOf(status) >= 0,
+        "attention": attention,
+        "running": running,
+        "badge": badge
+    };
+}
+
+// Material Symbols for T3 Code's machine kinds (environmentIcon / platform.machine).
+function machineIcon(kind) {
+    switch (kind) {
+    case "cloud":
+        return "cloud";
+    case "linux":
+        return "terminal";
+    case "desktop":
+        return "desktop_windows";
+    case "laptop":
+        return "laptop";
+    case "mac-mini":
+    case "mac-studio":
+        return "desktop_mac";
+    }
+    return "dns";
+}
+
+function machineName(kind) {
+    switch (kind) {
+    case "cloud":
+        return "Cloud VM";
+    case "linux":
+        return "Linux/WSL";
+    case "desktop":
+        return "Desktop";
+    case "laptop":
+        return "Laptop";
+    case "mac-mini":
+        return "Mini PC";
+    case "mac-studio":
+        return "Workstation";
+    }
+    return "Server";
+}

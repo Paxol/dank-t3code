@@ -92,6 +92,8 @@ SHELL_SNAPSHOT = {"kind": "snapshot", "snapshot": {
         shell("t-sub", "Subagent", lineage={"parentThreadId": "t-done", "relationshipToParent": "subagent",
                                             "rootThreadId": "t-done"}, activityRunStatus="running"),
         shell("t-settled", "Settled", settledAt=iso(-50), settledOverride="settled"),
+        shell("t-overridden", "Settled by override", settledOverride="settled"),
+        shell("t-delegated", "Delegated", delegatedFrom={"threadId": "t-done"}),
         shell("t-orphan", "No project", projectId="gone", latestRunId=None, latestRunCompletedAt=None, status="idle"),
     ]}}
 
@@ -126,8 +128,13 @@ def usage_summary(request):
 
 
 class FakeT3:
-    def __init__(self, token_type="Bearer", scope=None, grants="orchestration:read diagnostics:read", tokens=(TOKEN,)):
+    def __init__(self, token_type="Bearer", scope=None, grants="orchestration:read diagnostics:read", tokens=(TOKEN,),
+                 code=PAIRING_CODE, descriptor=None):
         self.token_type, self.grants = token_type, grants.split()
+        self.code = code
+        self.descriptor = descriptor  # what /.well-known/t3/environment answers; None for 404
+        self.projections, self.socket_queries = [], []
+        self.summary = usage_summary  # answers server.getUsageSummary
         self.scope = scope
         self.tokens = set(tokens)  # the tokens the server knows; removing one revokes it
         self.acks, self.shell_acks, self.pings, self.requests = 0, 0, 0, []
@@ -154,7 +161,7 @@ class FakeT3:
                 fake.proofs.append(self.headers.get("DPoP"))
                 if self.path == "/oauth/token":
                     form = dict(urllib.parse.parse_qsl(body))
-                    if form.get("subject_token") != PAIRING_CODE:
+                    if form.get("subject_token") != fake.code:
                         return self.reply(400, {"error": "invalid_grant"})
                     assert form["scope"] == "orchestration:read diagnostics:read", form["scope"]
                     assert form["subject_token_type"] == "urn:t3:params:oauth:token-type:environment-bootstrap"
@@ -173,7 +180,13 @@ class FakeT3:
             def do_GET(self):
                 url = urllib.parse.urlparse(self.path)
                 query = dict(urllib.parse.parse_qsl(url.query))
-                if url.path != "/ws" or query.get("wsTicket") != TICKET or query.get("orchestrationProtocol") != "2":
+                if url.path == "/.well-known/t3/environment":
+                    return self.reply(200, fake.descriptor) if fake.descriptor else self.reply(404, {})
+                # The protocol parameter goes only to servers whose descriptor says version 2.
+                protocol = (fake.descriptor or {}).get("orchestrationProtocolVersion", 2)
+                fake.socket_queries.append(query)
+                if (url.path != "/ws" or query.get("wsTicket") != TICKET
+                        or query.get("orchestrationProtocol") != ("2" if protocol == 2 else None)):
                     return self.reply(401, {})
                 assert "dpop" not in query, "a bearer socket carries no proof"
                 key = self.headers["Sec-WebSocket-Key"].encode()
@@ -260,10 +273,18 @@ class FakeT3:
                         {"kind": "thread.updated", "sequence": 11, "location": "archive",
                          "thread": shell("t-done", "Done", archivedAt=iso(-1))},
                         {"kind": "synchronized"}]})
+                elif frame["_tag"] == "Request" and frame["tag"] == "orchestration.getThreadProjection":
+                    self.projections.append(frame["payload"]["threadId"])
+                    self.send(sock, {"_tag": "Exit", "requestId": frame["id"], "exit": {"_tag": "Success", "value": {
+                        "thread": {"id": frame["payload"]["threadId"]}, "messages": [
+                            {"role": "assistant", "text": "Older reply", "createdAt": iso(-900), "updatedAt": iso(-900)},
+                            {"role": "user", "text": "Question", "createdAt": iso(-800), "updatedAt": iso(-800)},
+                            {"role": "assistant", "text": "## Latest\n**Done** with `it`.", "createdAt": iso(-700),
+                             "updatedAt": iso(-650)}]}}})
                 elif frame["_tag"] == "Request" and frame["tag"] == "server.getUsageSummary":
                     self.usage_requests.append(frame["payload"])
                     if "diagnostics:read" in self.grants:
-                        exit_value = {"_tag": "Success", "value": usage_summary(frame["payload"])}
+                        exit_value = {"_tag": "Success", "value": self.summary(frame["payload"])}
                     else:
                         exit_value = {"_tag": "Failure", "cause": {"_tag": "Fail", "error": {
                             "_tag": "EnvironmentAuthorizationError",
@@ -374,6 +395,8 @@ def main():
     check("enrichment snapshot keeps the threads and updates the project",
           len(inbox["threads"]) == 4 and by_id["t-approval"]["projectTitle"] == "Bar (resolved)")
     check("subagent and settled threads are left out", "t-sub" not in by_id and "t-settled" not in by_id)
+    check("settled-override and delegated threads are left out",
+          "t-overridden" not in by_id and "t-delegated" not in by_id)
     check("approval from the pending request", by_id["t-approval"]["status"] == "approval")
     check("working from the active run", by_id["t-working"]["status"] == "working"
           and by_id["t-working"]["statusSince"] is not None)
