@@ -28,7 +28,7 @@ This is a Linux port of [eliophan/t3code-bar](https://github.com/eliophan/t3code
 ## Installation
 
 ```bash
-git clone <this repository> ~/.config/dms/plugins/t3codeBar
+git clone https://github.com/Paxol/dank-t3code.git ~/.config/dms/plugins/t3codeBar
 dms ipc call plugin-scan scan
 dms ipc call plugins enable t3codeBar
 ```
